@@ -1,0 +1,166 @@
+# KUKA LBR4 Configuration for Transformer-based MPC
+
+# Robot Parameters
+robot:
+  name: "KUKA_LBR4"
+  dof: 7
+  urdf_path: "kuka_iiwa/urdf/iiwa7.urdf"
+  
+  # Joint limits (radians)
+  joint_limits:
+    min: [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
+    max: [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
+  
+  # Torque limits (Nm)
+  torque_limits:
+    min: [-320, -320, -176, -176, -110, -40, -40]
+    max: [320, 320, 176, 176, 110, 40, 40]
+  
+  # Velocity limits (rad/s)
+  velocity_limits:
+    min: [-1.7, -1.7, -1.75, -2.27, -2.44, -3.14, -3.14]
+    max: [1.7, 1.7, 1.75, 2.27, 2.44, 3.14, 3.14]
+
+# Data Generation
+data:
+  num_trajectories: 200
+  samples_per_trajectory: 100
+  sampling_time: 0.05  # 50ms
+  
+  # Noise parameters
+  noise:
+    position_std: 0.01  # rad
+    velocity_std: 0.05  # rad/s
+    torque_std: 0.5     # Nm
+  
+  # Trajectory types
+  trajectories:
+    - type: "pick_and_place"
+      weight: 0.4
+    - type: "circular"
+      weight: 0.3
+    - type: "figure_eight"
+      weight: 0.2
+    - type: "sinusoidal"
+      weight: 0.1
+  
+  # Train/val/test split
+  split:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+
+# Baseline DNN Model (from El-Hussieny et al.)
+baseline_dnn:
+  hidden_layers: [128, 32]
+  activation: "relu"
+  output_activation: "linear"
+  dropout: 0.0
+
+# Transformer Model
+transformer:
+  # Input parameters
+  history_length: 10  # Number of past timesteps
+  input_dim: 21  # 7 positions + 7 velocities + 7 torques
+  
+  # Architecture
+  d_model: 128
+  num_heads: 4
+  num_encoder_layers: 3
+  dim_feedforward: 256
+  dropout: 0.1
+  
+  # Positional encoding
+  max_len: 100
+  
+  # Output
+  output_dim: 14  # 7 positions + 7 velocities
+
+# Training Parameters
+training:
+  batch_size: 64
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"  # or "step", "exponential"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  
+  # Early stopping
+  early_stopping:
+    patience: 15
+    min_delta: 1.0e-5
+  
+  # Checkpointing
+  save_every: 10
+  save_best: true
+
+# MPC Parameters
+mpc:
+  prediction_horizon: 12
+  control_horizon: 12
+  sampling_time: 0.05  # 50ms
+  
+  # Cost function weights
+  weights:
+    state: 100.0  # W1
+    control: 0.01  # W2
+  
+  # Solver options
+  solver:
+    name: "ipopt"
+    options:
+      print_level: 0
+      max_iter: 100
+      tol: 1.0e-6
+      acceptable_tol: 1.0e-4
+  
+  # Constraints (will use robot limits from above)
+  apply_joint_constraints: true
+  apply_velocity_constraints: true
+  apply_torque_constraints: true
+  
+  # Additional nonlinear constraint (example from paper)
+  custom_constraints:
+    - joint: 0
+      type: "quadratic"
+      equation: "(q[0] - 1)^2 <= 0"
+
+# Evaluation
+evaluation:
+  metrics:
+    - "mse"
+    - "mae"
+    - "rmse"
+    - "max_error"
+  
+  # Test trajectories
+  test_scenarios:
+    - name: "point_stabilization"
+      num_targets: 5
+      duration: 10.0  # seconds
+    - name: "trajectory_tracking"
+      trajectory_type: "circular"
+      duration: 18.0
+    - name: "complex_tracking"
+      trajectory_type: "figure_eight"
+      duration: 20.0
+
+# Visualization
+visualization:
+  plot_every_n_epochs: 10
+  save_animations: true
+  comparison_plots: true
+
+# Logging
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  save_predictions: true
+  verbose: true
+
+# Random seed for reproducibility
+seed: 42
