@@ -58,6 +58,13 @@ class TransformerPredictor(nn.Module):
         self.input_dim = tf_config['input_dim']  # 21 (7 pos + 7 vel + 7 torque)
         self.d_model = tf_config['d_model']
         self.output_dim = tf_config['output_dim']  # 14 (7 pos + 7 vel)
+
+        self.register_buffer('pos_mean', torch.zeros(7))
+        self.register_buffer('pos_std', torch.ones(7))
+        self.register_buffer('vel_mean', torch.zeros(7))
+        self.register_buffer('vel_std', torch.ones(7))
+        self.register_buffer('tau_mean', torch.zeros(7))
+        self.register_buffer('tau_std', torch.ones(7))
         
         # Input embedding: project input features to d_model
         self.input_embedding = nn.Linear(self.input_dim, self.d_model)
@@ -116,30 +123,43 @@ class TransformerPredictor(nn.Module):
         Returns:
             next_state: (batch, 14) predicted [next_positions, next_velocities]
         """
-        # Concatenate inputs along feature dimension
-        # (batch, history_len, 21)
-        x = torch.cat([history_positions, history_velocities, history_torques], dim=-1)
+        # Normalize inputs across ALL timesteps
+        pos_norm = (history_positions - self.pos_mean) / (self.pos_std + 1e-6)
+        vel_norm = (history_velocities - self.vel_mean) / (self.vel_std + 1e-6)
+        tau_norm = (history_torques - self.tau_mean) / (self.tau_std + 1e-6)
         
-        # Input embedding: (batch, history_len, d_model)
+        # Concatenate normalized inputs
+        x = torch.cat([pos_norm, vel_norm, tau_norm], dim=-1)
+        
+        # Input embedding
         x = self.input_embedding(x)
         
         # Add positional encoding
         x = self.pos_encoder(x)
         
         # Pass through transformer encoder
-        # (batch, history_len, d_model)
         encoded = self.transformer_encoder(x)
         
         # Use the last time step for prediction
-        # (batch, d_model)
         last_encoded = encoded[:, -1, :]
         
-        # Project to output dimension
-        # (batch, 14)
-        next_state = self.output_projection(last_encoded)
+        # Predict DELTA (normalized space)
+        delta_state = self.output_projection(last_encoded)
         
-        return next_state
-    
+        # Denormalize deltas
+        delta_pos = delta_state[:, :self.dof] * self.pos_std
+        delta_vel = delta_state[:, self.dof:] * self.vel_std
+        
+        # Get current state (last timestep)
+        current_pos = history_positions[:, -1, :]
+        current_vel = history_velocities[:, -1, :]
+        
+        # Apply residual connection
+        next_pos = current_pos + delta_pos
+        next_vel = current_vel + delta_vel
+        
+        return torch.cat([next_pos, next_vel], dim=-1)   
+
     def predict_next_state(self, history_positions, history_velocities, history_torques):
         """
         Predict next state (convenience method)
@@ -209,6 +229,14 @@ class TransformerPredictorSingleStep(nn.Module):
         self.position_history.append(positions)
         self.velocity_history.append(velocities)
         self.torque_history.append(torques)
+
+        # Normalization statistics (compute from training data)
+        self.register_buffer('pos_mean', torch.zeros(7))
+        self.register_buffer('pos_std', torch.ones(7))
+        self.register_buffer('vel_mean', torch.zeros(7))
+        self.register_buffer('vel_std', torch.ones(7))
+        self.register_buffer('tau_mean', torch.zeros(7))
+        self.register_buffer('tau_std', torch.ones(7))
         
         # Keep only recent history
         if len(self.position_history) > self.history_length:
@@ -216,41 +244,21 @@ class TransformerPredictorSingleStep(nn.Module):
             self.velocity_history.pop(0)
             self.torque_history.pop(0)
     
-    def forward(self, positions, velocities, torques):
-        """
-        Single-step prediction with history management
+    def forward(self, history_positions, history_velocities, history_torques):
+        """Forward pass - predicts CHANGE in state"""
+        # Normalize inputs
+        pos_norm = (positions - self.pos_mean) / (self.pos_std + 1e-6)
+        vel_norm = (velocities - self.vel_mean) / (self.vel_std + 1e-6)
+        tau_norm = (torques - self.tau_mean) / (self.tau_std + 1e-6)
         
-        Args:
-            positions: (batch, 7) current positions
-            velocities: (batch, 7) current velocities
-            torques: (batch, 7) current torques
-            
-        Returns:
-            next_state: (batch, 14)
-        """
-        # Update history
-        self.update_history(positions, velocities, torques)
+        x = torch.cat([pos_norm, vel_norm, tau_norm], dim=-1)
+        delta_state = self.network(x)
         
-        # Pad history if not enough samples yet
-        hist_len = len(self.position_history)
-        if hist_len < self.history_length:
-            # Repeat first sample to fill history
-            pad_len = self.history_length - hist_len
-            for _ in range(pad_len):
-                self.position_history.insert(0, self.position_history[0])
-                self.velocity_history.insert(0, self.velocity_history[0])
-                self.torque_history.insert(0, self.torque_history[0])
+        # Denormalize outputs
+        delta_pos = delta_state[..., :7] * self.pos_std
+        delta_vel = delta_state[..., 7:] * self.vel_std
         
-        # Stack history
-        hist_pos = torch.cat(self.position_history, dim=0).unsqueeze(0)  # (1, hist, 7)
-        hist_vel = torch.cat(self.velocity_history, dim=0).unsqueeze(0)
-        hist_tau = torch.cat(self.torque_history, dim=0).unsqueeze(0)
-        
-        # Predict
-        next_state = self.transformer(hist_pos, hist_vel, hist_tau)
-        
-        return next_state
-
+        return torch.cat([positions + delta_pos, velocities + delta_vel], dim=-1)
 
 def create_transformer_model(config):
     """Factory function to create transformer model"""

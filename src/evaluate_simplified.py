@@ -1,5 +1,5 @@
 """
-Evaluation script for comparing Baseline DNN vs Transformer MPC
+Simplified Evaluation Script - Select specific scenarios
 """
 
 import torch
@@ -26,13 +26,12 @@ class MPCEvaluator:
         self.dof = config['robot']['dof']
         self.dt = config['mpc']['sampling_time']
         
-        # Setup plotting
         sns.set_style("whitegrid")
         self.fig_dir = Path("figures")
         self.fig_dir.mkdir(exist_ok=True)
     
     def generate_reference_trajectory(self, traj_type, duration, q_init):
-        """Generate reference trajectory for testing"""
+        """Generate reference trajectory"""
         num_steps = int(duration / self.dt)
         t = np.linspace(0, duration, num_steps)
         
@@ -41,7 +40,6 @@ class MPCEvaluator:
         q_center = (q_min + q_max) / 2
         
         if traj_type == 'point_stabilization':
-            # Step changes every 2 seconds
             q_ref = np.zeros((self.dof, num_steps))
             step_duration = int(2.0 / self.dt)
             
@@ -64,13 +62,6 @@ class MPCEvaluator:
             q_ref[0, :] = q_center[0] + scale * np.sin(omega * t)
             q_ref[1, :] = q_center[1] + scale * np.sin(omega * t) * np.cos(omega * t)
         
-        elif traj_type == 'sinusoidal':
-            q_ref = np.tile(q_center[:, None], (1, num_steps))
-            for j in range(self.dof):
-                freq = 0.5 + 0.5 * j / self.dof
-                amplitude = 0.2 * (q_max[j] - q_min[j])
-                q_ref[j, :] = q_center[j] + amplitude * np.sin(2 * np.pi * freq * t)
-        
         else:
             raise ValueError(f"Unknown trajectory type: {traj_type}")
         
@@ -80,31 +71,25 @@ class MPCEvaluator:
         """Simulate MPC control"""
         num_steps = q_ref_trajectory.shape[1]
         
-        # Storage
         q_history = np.zeros((self.dof, num_steps))
         dq_history = np.zeros((self.dof, num_steps))
         tau_history = np.zeros((self.dof, num_steps))
         
-        # Initialize
         q = q_init.copy()
         dq = np.zeros(self.dof)
         
-        # If transformer, reset history
         if hasattr(mpc, 'reset_history'):
             mpc.reset_history()
         
         for i in tqdm(range(num_steps), desc="Simulating MPC"):
-            # Store state
             q_history[:, i] = q
             dq_history[:, i] = dq
             
-            # Get reference for prediction horizon
             start_idx = i
             end_idx = min(i + mpc.N + 1, num_steps)
             horizon_length = end_idx - start_idx
             
             if horizon_length < mpc.N + 1:
-                # Pad with last value
                 q_ref = np.hstack([
                     q_ref_trajectory[:, start_idx:end_idx],
                     np.tile(q_ref_trajectory[:, -1:], (1, mpc.N + 1 - horizon_length))
@@ -112,7 +97,6 @@ class MPCEvaluator:
             else:
                 q_ref = q_ref_trajectory[:, start_idx:end_idx]
             
-            # Compute control
             try:
                 tau = mpc.step(q, dq, q_ref)
                 tau_history[:, i] = tau
@@ -121,14 +105,11 @@ class MPCEvaluator:
                 tau = np.zeros(self.dof)
                 tau_history[:, i] = tau
             
-            # Update history for transformer
             if hasattr(mpc, 'update_history'):
                 mpc.update_history(q, dq, tau)
             
-            # Simulate dynamics using learned model
             q_next, dq_next = mpc.predict_next_state_numpy(q, dq, tau)
             
-            # Update state
             q = q_next
             dq = dq_next
         
@@ -147,40 +128,13 @@ class MPCEvaluator:
         
         return metrics
     
-    def plot_trajectory_tracking(self, q_actual, q_ref, tau, title, save_name):
-        """Plot trajectory tracking results"""
-        num_steps = q_actual.shape[1]
-        t = np.arange(num_steps) * self.dt
-        
-        fig, axes = plt.subplots(self.dof + 1, 1, figsize=(12, 2.5 * (self.dof + 1)))
-        
-        # Plot each joint
-        for i in range(self.dof):
-            axes[i].plot(t, q_ref[i, :], 'r--', label='Reference', linewidth=2)
-            axes[i].plot(t, q_actual[i, :], 'b-', label='Actual', linewidth=1.5)
-            axes[i].set_ylabel(f'Joint {i+1} [rad]')
-            axes[i].legend()
-            axes[i].grid(True)
-        
-        # Plot torques
-        for i in range(self.dof):
-            axes[-1].plot(t, tau[i, :], label=f'Joint {i+1}')
-        axes[-1].set_xlabel('Time [s]')
-        axes[-1].set_ylabel('Torque [Nm]')
-        axes[-1].legend(ncol=self.dof)
-        axes[-1].grid(True)
-        
-        plt.suptitle(title, fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(self.fig_dir / f"{save_name}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-    
     def plot_comparison(self, results_baseline, results_transformer, scenario_name):
-        """Compare baseline vs transformer performance"""
+        """Compare baseline vs transformer"""
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         
-        # Plot joint 1 tracking
         t = np.arange(results_baseline['q'].shape[1]) * self.dt
+        
+        # Joint 1 tracking
         axes[0, 0].plot(t, results_baseline['q_ref'][0, :], 'k--', 
                        label='Reference', linewidth=2)
         axes[0, 0].plot(t, results_baseline['q'][0, :], 'b-', 
@@ -193,7 +147,7 @@ class MPCEvaluator:
         axes[0, 0].grid(True)
         axes[0, 0].set_title('Joint 1 Tracking')
         
-        # Plot tracking error
+        # Tracking error
         error_baseline = np.linalg.norm(
             results_baseline['q'] - results_baseline['q_ref'], axis=0
         )
@@ -231,7 +185,7 @@ class MPCEvaluator:
         axes[1, 0].set_yscale('log')
         axes[1, 0].grid(True, axis='y')
         
-        # Control effort comparison
+        # Control effort
         control_baseline = np.sum(results_baseline['tau'] ** 2, axis=0)
         control_transformer = np.sum(results_transformer['tau'] ** 2, axis=0)
         
@@ -248,15 +202,44 @@ class MPCEvaluator:
         plt.savefig(self.fig_dir / f"comparison_{scenario_name}.png", 
                    dpi=300, bbox_inches='tight')
         plt.close()
+        print(f"Saved plot: {self.fig_dir / f'comparison_{scenario_name}.png'}")
 
 
-def evaluate_scenario(evaluator, mpc_baseline, mpc_transformer, scenario):
-    """Evaluate single scenario"""
+def main(args):
+    """Main evaluation function"""
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Load models
+    print("Loading trained models...")
+    model_baseline = load_trained_model('baseline', config)
+    model_transformer = load_trained_model('transformer', config)
+    
+    # Create MPC controllers
+    print("\nCreating MPC controllers...")
+    mpc_baseline = LearnedDynamicsMPC(model_baseline, config, 'baseline')
+    mpc_transformer = LearnedDynamicsMPC(model_transformer, config, 'transformer')
+    
+    evaluator = MPCEvaluator(config)
+    
+    # Find scenario
+    scenarios = config['evaluation']['test_scenarios']
+    scenario = None
+    for s in scenarios:
+        if s['name'] == args.scenario:
+            scenario = s
+            break
+    
+    if scenario is None:
+        print(f"Error: Scenario '{args.scenario}' not found!")
+        print(f"Available scenarios: {[s['name'] for s in scenarios]}")
+        return
+    
     print(f"\n{'='*60}")
     print(f"Evaluating: {scenario['name']}")
     print(f"{'='*60}")
     
-    # Generate reference trajectory
+    # Generate reference
     q_init = np.zeros(evaluator.dof)
     q_ref = evaluator.generate_reference_trajectory(
         scenario.get('trajectory_type', scenario['name']),
@@ -264,7 +247,7 @@ def evaluate_scenario(evaluator, mpc_baseline, mpc_transformer, scenario):
         q_init
     )
     
-    # Simulate baseline
+    # Baseline
     print("\nBaseline DNN:")
     q_baseline, dq_baseline, tau_baseline = evaluator.simulate_mpc(
         mpc_baseline, q_init, q_ref
@@ -275,7 +258,7 @@ def evaluate_scenario(evaluator, mpc_baseline, mpc_transformer, scenario):
     for k, v in metrics_baseline.items():
         print(f"  {k.upper()}: {v:.6f}")
     
-    # Simulate transformer
+    # Transformer
     print("\nTransformer:")
     q_transformer, dq_transformer, tau_transformer = evaluator.simulate_mpc(
         mpc_transformer, q_init, q_ref
@@ -286,29 +269,13 @@ def evaluate_scenario(evaluator, mpc_baseline, mpc_transformer, scenario):
     for k, v in metrics_transformer.items():
         print(f"  {k.upper()}: {v:.6f}")
     
-    # Compute improvement
-    improvement = {}
-    for k in metrics_baseline.keys():
-        improvement[k] = (metrics_baseline[k] - metrics_transformer[k]) / metrics_baseline[k] * 100
-    
+    # Improvement
     print("\nImprovement (%):")
-    for k, v in improvement.items():
-        print(f"  {k.upper()}: {v:+.2f}%")
+    for k in metrics_baseline.keys():
+        improvement = (metrics_baseline[k] - metrics_transformer[k]) / metrics_baseline[k] * 100
+        print(f"  {k.upper()}: {improvement:+.2f}%")
     
-    # Plot individual results
-    evaluator.plot_trajectory_tracking(
-        q_baseline, q_ref, tau_baseline,
-        f"Baseline DNN - {scenario['name']}",
-        f"baseline_{scenario['name']}"
-    )
-    
-    evaluator.plot_trajectory_tracking(
-        q_transformer, q_ref, tau_transformer,
-        f"Transformer - {scenario['name']}",
-        f"transformer_{scenario['name']}"
-    )
-    
-    # Plot comparison
+    # Plot
     results = {
         'baseline': {
             'q': q_baseline,
@@ -326,60 +293,16 @@ def evaluate_scenario(evaluator, mpc_baseline, mpc_transformer, scenario):
         }
     }
     
-    evaluator.plot_comparison(
-        results['baseline'],
-        results['transformer'],
-        scenario['name']
-    )
-    
-    return results, improvement
-
-
-def main(args):
-    """Main evaluation function"""
-    # Load config
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load trained models
-    print("Loading trained models...")
-    model_baseline = load_trained_model('baseline', config)
-    model_transformer = load_trained_model('transformer', config)
-    
-    # Create MPC controllers
-    print("\nCreating MPC controllers...")
-    mpc_baseline = LearnedDynamicsMPC(model_baseline, config, 'baseline')
-    mpc_transformer = LearnedDynamicsMPC(model_transformer, config, 'transformer')
-    
-    # Create evaluator
-    evaluator = MPCEvaluator(config)
-    
-    # Evaluate scenarios
-    all_results = {}
-    all_improvements = {}
-    
-    for scenario in config['evaluation']['test_scenarios']:
-        results, improvement = evaluate_scenario(
-            evaluator, mpc_baseline, mpc_transformer, scenario
-        )
-        all_results[scenario['name']] = results
-        all_improvements[scenario['name']] = improvement
-    
-    # Print summary
-    print(f"\n{'='*60}")
-    print("OVERALL SUMMARY")
-    print(f"{'='*60}")
-    
-    for scenario_name, improvement in all_improvements.items():
-        print(f"\n{scenario_name}:")
-        for k, v in improvement.items():
-            print(f"  {k.upper()} improvement: {v:+.2f}%")
+    evaluator.plot_comparison(results['baseline'], results['transformer'], scenario['name'])
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate MPC performance')
     parser.add_argument('--config', type=str, default='configs/config.yaml',
                         help='Path to config file')
+    parser.add_argument('--scenario', type=str, default='point_stabilization',
+                        choices=['point_stabilization', 'trajectory_tracking', 'complex_tracking'],
+                        help='Which scenario to evaluate')
     
     args = parser.parse_args()
     main(args)

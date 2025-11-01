@@ -2,6 +2,7 @@
 Training script for both Baseline DNN and Transformer models
 """
 
+from matplotlib.pyplot import axis
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -161,43 +162,41 @@ class Trainer:
             next_positions = batch['next_positions'].to(self.device)
             next_velocities = batch['next_velocities'].to(self.device)
             
-            # Forward pass
             self.optimizer.zero_grad()
             
+            # Handle baseline vs transformer
             if self.model_type == 'baseline':
-                # Baseline DNN: single timestep input
-                if positions.dim() == 3:  # If accidentally has sequence dimension
+                # Baseline: single timestep
+                if positions.dim() == 3:
                     positions = positions[:, -1, :]
                     velocities = velocities[:, -1, :]
                     torques = torques[:, -1, :]
                 
+                # Model outputs next_state (already handles normalization internally)
                 predicted_state = self.model(positions, velocities, torques)
             else:
-                # Transformer: sequence input
+                # Transformer: sequence input (model handles normalization internally)
                 predicted_state = self.model(positions, velocities, torques)
             
             # Split predictions
             pred_positions = predicted_state[:, :7]
             pred_velocities = predicted_state[:, 7:]
             
-            # Compute loss
+            # Compute loss on ABSOLUTE states (model already does residual internally)
             loss_pos = self.criterion(pred_positions, next_positions)
             loss_vel = self.criterion(pred_velocities, next_velocities)
             loss = loss_pos + loss_vel
             
             # Backward pass
             loss.backward()
-            
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
             self.optimizer.step()
             
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
         
-        return total_loss / len(train_loader)
-    
+        return total_loss / len(train_loader)  
+
     def validate(self, val_loader):
         """Validate model"""
         self.model.eval()
@@ -325,9 +324,30 @@ def main(args):
     print(f"\nLoading data from {args.data_path}")
     train_dataset = RobotDataset(args.data_path, 'train', history_length)
     val_dataset = RobotDataset(args.data_path, 'val', history_length)
-    
+   
+    # Compute normalization statistics from TRAINING data only
+    if history_length == 1:
+        pos_mean = train_dataset.positions.mean(axis=0)
+        pos_std = train_dataset.positions.std(axis=0) + 1e-6
+        vel_mean = train_dataset.velocities.mean(axis=0)
+        vel_std = train_dataset.velocities.std(axis=0) + 1e-6
+        tau_mean = train_dataset.torques.mean(axis=0)
+        tau_std = train_dataset.torques.std(axis=0) + 1e-6
+    else:
+        # For transformer with sequences, compute over all timesteps
+        pos_mean = train_dataset.positions.reshape(-1, 7).mean(axis=0)
+        pos_std = train_dataset.positions.reshape(-1, 7).std(axis=0) + 1e-6
+        vel_mean = train_dataset.velocities.reshape(-1, 7).mean(axis=0)
+        vel_std = train_dataset.velocities.reshape(-1, 7).std(axis=0) + 1e-6
+        tau_mean = train_dataset.torques.reshape(-1, 7).mean(axis=0)
+        tau_std = train_dataset.torques.reshape(-1, 7).std(axis=0) + 1e-6
+
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
+    print(f"Normalization stats computed:")
+    print(f"  pos_std: {pos_std}")
+    print(f"  vel_std: {vel_std}")
+    print(f"  tau_std: {tau_std}")
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -350,6 +370,13 @@ def main(args):
         model = create_baseline_model(config)
     else:
         model = create_transformer_model(config)
+
+    model.pos_mean.copy_(torch.FloatTensor(pos_mean))
+    model.pos_std.copy_(torch.FloatTensor(pos_std))
+    model.vel_mean.copy_(torch.FloatTensor(vel_mean))
+    model.vel_std.copy_(torch.FloatTensor(vel_std))
+    model.tau_mean.copy_(torch.FloatTensor(tau_mean))
+    model.tau_std.copy_(torch.FloatTensor(tau_std))
     
     # Create trainer
     trainer = Trainer(model, config, args.model_type)

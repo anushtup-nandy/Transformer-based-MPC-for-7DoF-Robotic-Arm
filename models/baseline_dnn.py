@@ -1,6 +1,6 @@
 """
-Baseline Feed-Forward DNN Model
-Based on El-Hussieny et al. (2024) paper
+Baseline Feed-Forward DNN Model - FIXED with Residual Learning
+Predicts CHANGES (deltas) instead of absolute next states
 """
 
 import torch
@@ -9,7 +9,7 @@ import torch.nn as nn
 
 class BaselineDNN(nn.Module):
     """
-    Feed-forward DNN for predicting next robot state
+    Feed-forward DNN for predicting DELTA in robot state
     Architecture: input -> [128] -> [32] -> output
     """
     
@@ -21,9 +21,18 @@ class BaselineDNN(nn.Module):
         dnn_config = config['baseline_dnn']
         
         # Input: [positions (7), velocities (7), torques (7)] = 21
-        # Output: [next_positions (7), next_velocities (7)] = 14
+        # Output: [delta_positions (7), delta_velocities (7)] = 14
         self.input_dim = 3 * robot_config['dof']  # 21
         self.output_dim = 2 * robot_config['dof']  # 14
+        self.dt = config['data']['sampling_time']  # 0.05s
+
+        # Normalization statistics (compute from training data)
+        self.register_buffer('pos_mean', torch.zeros(7))
+        self.register_buffer('pos_std', torch.ones(7))
+        self.register_buffer('vel_mean', torch.zeros(7))
+        self.register_buffer('vel_std', torch.ones(7))
+        self.register_buffer('tau_mean', torch.zeros(7))
+        self.register_buffer('tau_std', torch.ones(7))
         
         # Build network layers
         layers = []
@@ -46,10 +55,8 @@ class BaselineDNN(nn.Module):
             
             prev_dim = hidden_dim
         
-        # Output layer
+        # Output layer - predicts DELTA
         layers.append(nn.Linear(prev_dim, self.output_dim))
-        
-        # No activation on output (linear)
         
         self.network = nn.Sequential(*layers)
         
@@ -66,24 +73,28 @@ class BaselineDNN(nn.Module):
     
     def forward(self, positions, velocities, torques):
         """
-        Forward pass
-        
-        Args:
-            positions: (batch, 7) current joint positions
-            velocities: (batch, 7) current joint velocities  
-            torques: (batch, 7) applied torques
-            
-        Returns:
-            next_state: (batch, 14) predicted [next_positions, next_velocities]
+        Forward pass - predicts next state
         """
-        # Concatenate inputs
-        x = torch.cat([positions, velocities, torques], dim=-1)
+        # Normalize inputs
+        pos_norm = (positions - self.pos_mean) / (self.pos_std + 1e-6)
+        vel_norm = (velocities - self.vel_mean) / (self.vel_std + 1e-6)
+        tau_norm = (torques - self.tau_mean) / (self.tau_std + 1e-6)
         
-        # Forward pass
-        next_state = self.network(x)
+        x = torch.cat([pos_norm, vel_norm, tau_norm], dim=-1)
         
-        return next_state
-    
+        # Predict DELTA in normalized space
+        delta_state = self.network(x)
+        
+        # Denormalize deltas
+        delta_pos = delta_state[:, :7] * self.pos_std
+        delta_vel = delta_state[:, 7:] * self.vel_std
+        
+        # Apply residual connection
+        next_pos = positions + delta_pos
+        next_vel = velocities + delta_vel
+        
+        return torch.cat([next_pos, next_vel], dim=-1)   
+
     def predict_next_state(self, positions, velocities, torques):
         """
         Predict next state (convenience method)
@@ -107,7 +118,6 @@ def create_baseline_model(config):
     model = BaselineDNN(config)
     print(f"Baseline DNN created with {model.get_param_count():,} parameters")
     return model
-
 
 if __name__ == "__main__":
     import yaml

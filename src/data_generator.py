@@ -66,7 +66,7 @@ class SimpleFourierDataGenerator:
         
         robot_id = p.loadURDF(
             urdf_path,
-            basePosition=[0, 0, 0],
+            basePosition=[0, 0, 1],
             useFixedBase=True,
             flags=p.URDF_USE_INERTIA_FROM_FILE
         )
@@ -149,7 +149,7 @@ class SimpleFourierDataGenerator:
                 freq = k * base_freq
                 
                 # Random amplitude (10-30% of max torque)
-                amp = np.random.uniform(0.1, 0.3) * tau_limit
+                amp = np.random.uniform(0.05, 0.15) * tau_limit
                 
                 # Random phase
                 phase = np.random.uniform(0, 2*np.pi)

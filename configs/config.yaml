@@ -100,8 +100,8 @@ training:
 
 # MPC Parameters
 mpc:
-  prediction_horizon: 12
-  control_horizon: 12
+  prediction_horizon: 8
+  control_horizon: 8
   sampling_time: 0.05  # 50ms
   
   # Cost function weights

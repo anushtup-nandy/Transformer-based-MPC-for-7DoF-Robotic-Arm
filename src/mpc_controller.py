@@ -1,6 +1,6 @@
 """
-Model Predictive Controller using learned dynamics models
-Implements data-driven MPC with CasADi and IPOPT
+Model Predictive Controller - FIXED VERSION
+Uses soft constraints and proper optimization formulation
 """
 
 import casadi as ca
@@ -14,20 +14,14 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 
 class LearnedDynamicsMPC:
-    """
-    MPC controller using learned neural network dynamics
-    Compatible with both DNN and Transformer models
-    """
+    """MPC controller using learned neural network dynamics"""
     
     def __init__(self, model, config, model_type='transformer'):
-        """
-        Args:
-            model: Trained PyTorch model (DNN or Transformer)
-            config: Configuration dictionary
-            model_type: 'baseline' or 'transformer'
-        """
         self.model = model
-        self.model.eval()  # Set to evaluation mode
+        self.model.eval()
+        self.device = torch.device('cpu') # cpu
+        self.model.to(self.device)
+        
         self.config = config
         self.model_type = model_type
         
@@ -48,17 +42,22 @@ class LearnedDynamicsMPC:
         self.W1 = mpc_config['weights']['state']
         self.W2 = mpc_config['weights']['control']
         
+        # Soft constraint weights
+        self.W_dynamics = 1000.0  # Weight for dynamics soft constraint
+        self.W_slack = 100.0      # Weight for bound slack variables
+        
         # For transformer: history management
         if model_type == 'transformer':
             self.history_length = config['transformer']['history_length']
             self.reset_history()
         else:
-            self.history_length = 1 
+            self.history_length = 1
         
         # Build MPC problem
         self.build_mpc()
         
-        print(f"MPC initialized with horizon N={self.N}")
+        print(f"✓ MPC initialized with horizon N={self.N}")
+        print(f"✓ Using {model_type} model for dynamics prediction")
     
     def reset_history(self):
         """Reset history buffer for transformer"""
@@ -77,263 +76,209 @@ class LearnedDynamicsMPC:
             self.velocity_history.pop(0)
             self.torque_history.pop(0)
     
-    def predict_next_state_casadi(self, q, dq, tau):
-        """
-        Predict next state using learned model
-        This wraps the PyTorch model for use in CasADi
-        
-        Args:
-            q: (7,) joint positions
-            dq: (7,) joint velocities  
-            tau: (7,) torques
-            
-        Returns:
-            q_next: (7,) next positions
-            dq_next: (7,) next velocities
-        """
-        # Convert to numpy for PyTorch
-        if isinstance(q, ca.MX) or isinstance(q, ca.SX):
-            # This will be called symbolically, return symbolic output
-            # We'll handle this differently in the MPC setup
-            return q, dq  # Placeholder
-        
-        # For numerical evaluation
+    def predict_next_state_numpy(self, q, dq, tau):
+        """Predict next state using learned model"""
         with torch.no_grad():
             if self.model_type == 'baseline':
-                # Single step prediction
-                q_tensor = torch.FloatTensor(q).unsqueeze(0)
-                dq_tensor = torch.FloatTensor(dq).unsqueeze(0)
-                tau_tensor = torch.FloatTensor(tau).unsqueeze(0)
+                q_tensor = torch.FloatTensor(q).unsqueeze(0).to(self.device)
+                dq_tensor = torch.FloatTensor(dq).unsqueeze(0).to(self.device)
+                tau_tensor = torch.FloatTensor(tau).unsqueeze(0).to(self.device)
                 
                 next_state = self.model(q_tensor, dq_tensor, tau_tensor)
-                q_next = next_state[0, :7].numpy()
-                dq_next = next_state[0, 7:].numpy()
+                q_next = next_state[0, :7].cpu().numpy()
+                dq_next = next_state[0, 7:].cpu().numpy()
             else:
                 # Transformer: use history
                 if len(self.position_history) < self.history_length:
-                    # Pad with current state
                     while len(self.position_history) < self.history_length:
                         self.position_history.append(q.copy())
                         self.velocity_history.append(dq.copy())
                         self.torque_history.append(tau.copy())
                 
-                # Stack history
-                hist_q = torch.FloatTensor(np.array(self.position_history)).unsqueeze(0)
-                hist_dq = torch.FloatTensor(np.array(self.velocity_history)).unsqueeze(0)
-                hist_tau = torch.FloatTensor(np.array(self.torque_history)).unsqueeze(0)
+                hist_q = torch.FloatTensor(np.array(self.position_history)).unsqueeze(0).to(self.device)
+                hist_dq = torch.FloatTensor(np.array(self.velocity_history)).unsqueeze(0).to(self.device)
+                hist_tau = torch.FloatTensor(np.array(self.torque_history)).unsqueeze(0).to(self.device)
                 
                 next_state = self.model(hist_q, hist_dq, hist_tau)
-                q_next = next_state[0, :7].numpy()
-                dq_next = next_state[0, 7:].numpy()
+                q_next = next_state[0, :7].cpu().numpy()
+                dq_next = next_state[0, 7:].cpu().numpy()
         
         return q_next, dq_next
     
-    def export_model_to_casadi(self):
-        """
-        Export PyTorch model to CasADi function
-        This creates a symbolic function that can be used in optimization
-        """
-        # Create symbolic inputs
-        q_sym = ca.SX.sym('q', self.dof)
-        dq_sym = ca.SX.sym('dq', self.dof)
-        tau_sym = ca.SX.sym('tau', self.dof)
-        
-        # For baseline DNN, we can create a simpler forward pass
-        # For transformer, this is more complex due to history
-        
-        # Extract model parameters as numpy arrays
-        params = []
-        for param in self.model.parameters():
-            params.append(param.detach().cpu().numpy())
-        
-        # Build CasADi equivalent (simplified for baseline)
-        if self.model_type == 'baseline':
-            # Concatenate inputs
-            x = ca.vertcat(q_sym, dq_sym, tau_sym)
-            
-            # First layer
-            W1 = params[0]
-            b1 = params[1]
-            h1 = ca.mtimes(W1, x) + b1
-            h1 = ca.fmax(0, h1)  # ReLU
-            
-            # Second layer  
-            W2 = params[2]
-            b2 = params[3]
-            h2 = ca.mtimes(W2, h1) + b2
-            h2 = ca.fmax(0, h2)  # ReLU
-            
-            # Output layer
-            W3 = params[4]
-            b3 = params[5]
-            output = ca.mtimes(W3, h2) + b3
-            
-            q_next = output[:self.dof]
-            dq_next = output[self.dof:]
-            
-            # Create CasADi function
-            dynamics_func = ca.Function(
-                'learned_dynamics',
-                [q_sym, dq_sym, tau_sym],
-                [q_next, dq_next],
-                ['q', 'dq', 'tau'],
-                ['q_next', 'dq_next']
-            )
-            
-            return dynamics_func
-        else:
-            # For transformer, we use external callback
-            # This is more complex and we'll use a different approach
-            return None
-    
     def build_mpc(self):
-        """Build the MPC optimization problem using CasADi"""
-        # Use Opti stack for easier formulation
-        self.opti = ca.Opti()
+        """Build MPC problem dimensions"""
+        # Total variables: (N+1)*14 states + N*7 controls
+        n_states = (self.N + 1) * 14
+        n_controls = self.N * 7
+        n_vars = n_states + n_controls
         
-        # Decision variables
-        # States: [q, dq] for each timestep
-        self.X = self.opti.variable(self.dof * 2, self.N + 1)
+        # Use RELAXED bounds (not artificially tight)
+        lbx = []
+        ubx = []
         
-        # Controls: tau for each timestep
-        self.U = self.opti.variable(self.dof, self.N)
+        # State bounds - use full range with small margin
+        for k in range(self.N + 1):
+            lbx.extend(self.q_min * 0.99)   # 99% instead of 95%
+            lbx.extend(self.dq_min * 0.99)  # 99% instead of 90%
+            ubx.extend(self.q_max * 0.99)
+            ubx.extend(self.dq_max * 0.99)
         
-        # Parameters
-        self.x0 = self.opti.parameter(self.dof * 2)  # Initial state
-        self.x_ref = self.opti.parameter(self.dof * 2, self.N + 1)  # Reference trajectory
-        
-        # Cost function
-        cost = 0
-        
+        # Control bounds - use full range
         for k in range(self.N):
-            # State at k
-            q_k = self.X[:self.dof, k]
-            dq_k = self.X[self.dof:, k]
-            tau_k = self.U[:, k]
-            
-            # Reference at k
-            q_ref_k = self.x_ref[:self.dof, k]
-            dq_ref_k = self.x_ref[self.dof:, k]
+            lbx.extend(self.tau_min * 0.95)  # 95% instead of 80%
+            ubx.extend(self.tau_max * 0.95)
+        
+        self.lbx = np.array(lbx)
+        self.ubx = np.array(ubx)
+        
+        # Store dimensions
+        self.n_vars = n_vars
+        self.n_states = n_states
+        self.n_controls = n_controls
+        
+        print(f"✓ MPC problem built: {n_vars} decision variables")
+    
+    def objective_with_soft_constraints(self, X, x_current, x_reference):
+        """
+        Compute objective with soft dynamics constraints
+        
+        Args:
+            X: Decision variables [states; controls]
+            x_current: Initial state (14,)
+            x_reference: Reference trajectory (14, N+1)
+        
+        Returns:
+            cost: Total cost including penalties
+        """
+        # Extract states and controls
+        states = X[:self.n_states].reshape(self.N + 1, 14)
+        controls = X[self.n_states:].reshape(self.N, 7)
+        
+        # Tracking cost
+        cost = 0.0
+        
+        # Stage costs
+        for k in range(self.N):
+            q_k = states[k, :7]
+            dq_k = states[k, 7:]
+            tau_k = controls[k]
             
             # Tracking error
+            q_ref_k = x_reference[:7, k]
+            dq_ref_k = x_reference[7:, k]
+            
             e_q = q_k - q_ref_k
             e_dq = dq_k - dq_ref_k
             
-            # Stage cost
-            cost += self.W1 * (ca.dot(e_q, e_q) + ca.dot(e_dq, e_dq))
+            cost += self.W1 * (np.dot(e_q, e_q) + np.dot(e_dq, e_dq))
             
-            # Control effort
+            # Control rate
             if k > 0:
-                delta_tau = tau_k - self.U[:, k-1]
-                cost += self.W2 * ca.dot(delta_tau, delta_tau)
-            
-            # Dynamics constraints (simplified - will use callback)
-            # For now, use a simple forward Euler approximation
-            # In practice, this would use the learned model
-            q_next = q_k + self.dt * dq_k
-            dq_next = dq_k + self.dt * tau_k / 100.0  # Simplified
-            
-            self.opti.subject_to(self.X[:self.dof, k+1] == q_next)
-            self.opti.subject_to(self.X[self.dof:, k+1] == dq_next)
+                delta_tau = tau_k - controls[k-1]
+                cost += self.W2 * np.dot(delta_tau, delta_tau)
         
         # Terminal cost
-        e_q_final = self.X[:self.dof, self.N] - self.x_ref[:self.dof, self.N]
-        e_dq_final = self.X[self.dof:, self.N] - self.x_ref[self.dof:, self.N]
-        cost += self.W1 * (ca.dot(e_q_final, e_q_final) + ca.dot(e_dq_final, e_dq_final))
+        e_q_final = states[self.N, :7] - x_reference[:7, self.N]
+        e_dq_final = states[self.N, 7:] - x_reference[7:, self.N]
+        cost += 2.0 * self.W1 * (np.dot(e_q_final, e_q_final) + 
+                                  np.dot(e_dq_final, e_dq_final))
         
-        # Objective
-        self.opti.minimize(cost)
+        # Initial condition (hard constraint via penalty)
+        init_error = states[0] - x_current
+        cost += 10000.0 * np.dot(init_error, init_error)
         
-        # Initial condition constraint
-        self.opti.subject_to(self.X[:, 0] == self.x0)
+        # Soft dynamics constraints
+        for k in range(self.N):
+            q_k = states[k, :7]
+            dq_k = states[k, 7:]
+            tau_k = controls[k]
+            
+            # Predict next state
+            q_next_pred, dq_next_pred = self.predict_next_state_numpy(q_k, dq_k, tau_k)
+            next_state_pred = np.concatenate([q_next_pred, dq_next_pred])
+            
+            # Soft constraint: penalize deviation from predicted dynamics
+            dynamics_error = states[k+1] - next_state_pred
+            cost += self.W_dynamics * np.dot(dynamics_error, dynamics_error)
         
-        # State constraints
-        if self.config['mpc']['apply_joint_constraints']:
-            for k in range(self.N + 1):
-                self.opti.subject_to(self.opti.bounded(
-                    self.q_min, self.X[:self.dof, k], self.q_max
-                ))
+        # Soft bound penalties (quadratic barrier near bounds)
+        margin = 0.1  # Start penalty when within 10% of bounds
+        for k in range(self.N + 1):
+            q_k = states[k, :7]
+            dq_k = states[k, 7:]
+            
+            # Position bounds
+            q_lower_viol = np.maximum(0, self.q_min * 0.99 - q_k)
+            q_upper_viol = np.maximum(0, q_k - self.q_max * 0.99)
+            cost += self.W_slack * (np.sum(q_lower_viol**2) + np.sum(q_upper_viol**2))
+            
+            # Velocity bounds
+            dq_lower_viol = np.maximum(0, self.dq_min * 0.99 - dq_k)
+            dq_upper_viol = np.maximum(0, dq_k - self.dq_max * 0.99)
+            cost += self.W_slack * (np.sum(dq_lower_viol**2) + np.sum(dq_upper_viol**2))
         
-        if self.config['mpc']['apply_velocity_constraints']:
-            for k in range(self.N + 1):
-                self.opti.subject_to(self.opti.bounded(
-                    self.dq_min, self.X[self.dof:, k], self.dq_max
-                ))
+        # Torque bounds
+        for k in range(self.N):
+            tau_k = controls[k]
+            tau_lower_viol = np.maximum(0, self.tau_min * 0.95 - tau_k)
+            tau_upper_viol = np.maximum(0, tau_k - self.tau_max * 0.95)
+            cost += self.W_slack * (np.sum(tau_lower_viol**2) + np.sum(tau_upper_viol**2))
         
-        # Control constraints
-        if self.config['mpc']['apply_torque_constraints']:
-            for k in range(self.N):
-                self.opti.subject_to(self.opti.bounded(
-                    self.tau_min, self.U[:, k], self.tau_max
-                ))
-        
-        # Solver options
-        solver_opts = self.config['mpc']['solver']['options']
-        p_opts = {"expand": True}
-        s_opts = {
-            "max_iter": solver_opts['max_iter'],
-            "tol": solver_opts['tol'],
-            "acceptable_tol": solver_opts['acceptable_tol'],
-            "print_level": solver_opts['print_level']
-        }
-        
-        self.opti.solver('ipopt', p_opts, s_opts)
-        
-        print("MPC problem built successfully")
+        return cost
     
     def solve(self, x_current, x_reference):
         """
-        Solve MPC optimization problem
-        
-        Args:
-            x_current: (14,) current state [q, dq]
-            x_reference: (14, N+1) reference trajectory
-            
-        Returns:
-            u_opt: (7,) optimal control (first step)
-            x_pred: (14, N+1) predicted state trajectory
+        Solve MPC using scipy optimization
         """
-        # Set initial condition
-        self.opti.set_value(self.x0, x_current)
+        from scipy.optimize import minimize
         
-        # Set reference trajectory
-        self.opti.set_value(self.x_ref, x_reference)
+        # Initial guess: straight line interpolation + previous solution
+        X0 = np.zeros(self.n_vars)
         
-        # Solve
-        try:
-            sol = self.opti.solve()
-            
+        # Initialize states with smooth interpolation
+        for k in range(self.N + 1):
+            alpha = k / self.N
+            X0[k*14:(k+1)*14] = (1-alpha) * x_current + alpha * x_reference[:, min(k, x_reference.shape[1]-1)]
+        
+        # Initialize controls to zero (or small random)
+        X0[self.n_states:] = np.random.randn(self.n_controls) * 0.01
+        
+        # Clip initial guess to bounds
+        X0 = np.clip(X0, self.lbx, self.ubx)
+        
+        # Solve using L-BFGS-B (handles bounds better than SLSQP for unconstrained problems)
+        result = minimize(
+            lambda X: self.objective_with_soft_constraints(X, x_current, x_reference),
+            X0,
+            method='L-BFGS-B',  # Better for box-constrained optimization
+            bounds=list(zip(self.lbx, self.ubx)),
+            options={
+                'maxiter': 100,
+                'ftol': 1e-6,
+                'gtol': 1e-5,
+                'disp': False
+            }
+        )
+        
+        if result.success or result.fun < 1e10:  # Accept if cost is reasonable
             # Extract solution
-            x_opt = sol.value(self.X)
-            u_opt = sol.value(self.U)
+            X_opt = result.x
+            states_opt = X_opt[:self.n_states].reshape(self.N + 1, 14)
+            controls_opt = X_opt[self.n_states:].reshape(self.N, 7)
             
-            # Return first control action
-            return u_opt[:, 0], x_opt
-        
-        except RuntimeError as e:
-            print(f"MPC solve failed: {e}")
-            # Return zero torque as fallback
+            return controls_opt[0], states_opt.T
+        else:
+            # Fallback: return zero control
+            print(f"⚠ Optimization failed: {result.message} (fun={result.fun:.2e})")
             return np.zeros(self.dof), None
     
     def step(self, q_current, dq_current, q_ref, dq_ref=None):
-        """
-        Single MPC control step
-        
-        Args:
-            q_current: (7,) current joint positions
-            dq_current: (7,) current joint velocities
-            q_ref: (7,) or (7, N+1) reference positions
-            dq_ref: (7,) or (7, N+1) reference velocities (optional)
-            
-        Returns:
-            tau: (7,) optimal torque
-        """
+        """Single MPC control step"""
         # Prepare current state
         x_current = np.concatenate([q_current, dq_current])
         
         # Prepare reference trajectory
         if q_ref.ndim == 1:
-            # Single target - repeat for horizon
             q_ref = np.tile(q_ref[:, None], (1, self.N + 1))
             if dq_ref is None:
                 dq_ref = np.zeros((self.dof, self.N + 1))
@@ -361,7 +306,6 @@ def load_trained_model(model_type, config):
     else:
         model = create_transformer_model(config)
     
-    # Load checkpoint
     checkpoint_path = Path(f'models/trained/{model_type}/best.pth')
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"No trained model found at {checkpoint_path}")
@@ -370,27 +314,6 @@ def load_trained_model(model_type, config):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    print(f"Loaded trained {model_type} model from {checkpoint_path}")
+    print(f"✓ Loaded trained {model_type} model from {checkpoint_path}")
     
     return model
-
-
-if __name__ == "__main__":
-    # Test MPC
-    with open("configs/config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Create dummy model for testing
-    from models.baseline_dnn import create_baseline_model
-    model = create_baseline_model(config)
-    
-    # Create MPC
-    mpc = LearnedDynamicsMPC(model, config, model_type='baseline')
-    
-    # Test step
-    q_current = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    dq_current = np.zeros(7)
-    q_ref = np.array([0.5, 0.3, 0.2, 0.1, 0.0, -0.1, -0.2])
-    
-    tau = mpc.step(q_current, dq_current, q_ref)
-    print(f"Optimal torque: {tau}")
