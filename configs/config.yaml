@@ -68,7 +68,7 @@ transformer:
   num_heads: 4
   num_encoder_layers: 3
   dim_feedforward: 256
-  dropout: 0.1
+  dropout: 0.2
   
   # Positional encoding
   max_len: 100
@@ -79,19 +79,24 @@ transformer:
 # Training Parameters
 training:
   batch_size: 64
+  transformer_batch_size: 128
   num_epochs: 100
-  learning_rate: 0.001
+  
+  baseline_lr: 0.001
+  transformer_lr: 0.0003
+
   weight_decay: 1.0e-5
+  transformer_wd: 1.0e-4 
   
   # Learning rate scheduler
   scheduler:
     type: "cosine"  # or "step", "exponential"
-    warmup_epochs: 5
+    warmup_epochs: 10
     min_lr: 1.0e-6
   
   # Early stopping
   early_stopping:
-    patience: 15
+    patience: 30
     min_delta: 1.0e-5
   
   # Checkpointing

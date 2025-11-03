@@ -112,34 +112,49 @@ def check_model_predictions(model, model_type, data, config):
     print(f"  tau_mean: {model.tau_mean.cpu().numpy()}")
     print(f"  tau_std:  {model.tau_std.cpu().numpy()}")
     
-    # Test on validation data
-    val_pos = data['val_positions']
-    val_vel = data['val_velocities']
-    val_tau = data['val_torques']
-    val_next_pos = data['val_next_positions']
-    val_next_vel = data['val_next_velocities']
-    
-    # Take first 100 samples
-    n_test = 100
-    
+    # ✅ FIX: Handle data loading differently for baseline vs transformer
     if model_type == 'baseline':
-        # Baseline takes single timestep
-        if val_pos.ndim == 3:
-            test_pos = val_pos[:n_test, -1, :]
-            test_vel = val_vel[:n_test, -1, :]
-            test_tau = val_tau[:n_test, -1, :]
-        else:
-            test_pos = val_pos[:n_test]
-            test_vel = val_vel[:n_test]
-            test_tau = val_tau[:n_test]
-    else:
-        # Transformer needs sequences
+        # Baseline uses single timesteps
+        val_pos = data['val_positions']
+        val_vel = data['val_velocities']
+        val_tau = data['val_torques']
+        val_next_pos = data['val_next_positions']
+        val_next_vel = data['val_next_velocities']
+        
+        n_test = min(100, len(val_pos))
         test_pos = val_pos[:n_test]
         test_vel = val_vel[:n_test]
         test_tau = val_tau[:n_test]
-    
-    test_next_pos = val_next_pos[:n_test]
-    test_next_vel = val_next_vel[:n_test]
+        test_next_pos = val_next_pos[:n_test]
+        test_next_vel = val_next_vel[:n_test]
+        
+    else:  # transformer
+        # ✅ Create sequences for transformer
+        history_length = config['transformer']['history_length']
+        
+        val_pos = data['val_positions']
+        val_vel = data['val_velocities']
+        val_tau = data['val_torques']
+        val_next_pos = data['val_next_positions']
+        val_next_vel = data['val_next_velocities']
+        
+        # Create sequences
+        n_samples = len(val_pos)
+        n_sequences = n_samples - history_length + 1
+        n_test = min(100, n_sequences)
+        
+        test_pos = np.zeros((n_test, history_length, 7))
+        test_vel = np.zeros((n_test, history_length, 7))
+        test_tau = np.zeros((n_test, history_length, 7))
+        test_next_pos = np.zeros((n_test, 7))
+        test_next_vel = np.zeros((n_test, 7))
+        
+        for i in range(n_test):
+            test_pos[i] = val_pos[i:i+history_length]
+            test_vel[i] = val_vel[i:i+history_length]
+            test_tau[i] = val_tau[i:i+history_length]
+            test_next_pos[i] = val_next_pos[i+history_length-1]
+            test_next_vel[i] = val_next_vel[i+history_length-1]
     
     # Predict
     with torch.no_grad():
@@ -155,7 +170,7 @@ def check_model_predictions(model, model_type, data, config):
     pos_error = pred_pos - test_next_pos
     vel_error = pred_vel - test_next_vel
     
-    print(f"\nPrediction Errors (on {n_test} validation samples):")
+    print(f"\nPrediction Errors (on {len(test_pos)} validation samples):")
     print(f"\nPosition Error:")
     print(f"  Mean: {np.mean(np.abs(pos_error), axis=0)}")
     print(f"  Std:  {np.std(pos_error, axis=0)}")
@@ -182,17 +197,19 @@ def check_model_predictions(model, model_type, data, config):
     # Plot predictions vs ground truth
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
+    n_plot = min(50, len(test_pos))
+    
     # Position predictions for joint 0
-    axes[0].plot(test_next_pos[:50, 0], 'b-', label='Ground Truth', linewidth=2)
-    axes[0].plot(pred_pos[:50, 0], 'r--', label='Predicted', linewidth=2)
+    axes[0].plot(test_next_pos[:n_plot, 0], 'b-', label='Ground Truth', linewidth=2)
+    axes[0].plot(pred_pos[:n_plot, 0], 'r--', label='Predicted', linewidth=2)
     axes[0].set_ylabel('Joint 0 Position [rad]')
     axes[0].set_title(f'{model_type} - Position Predictions')
     axes[0].legend()
     axes[0].grid(True)
     
     # Velocity predictions for joint 0
-    axes[1].plot(test_next_vel[:50, 0], 'b-', label='Ground Truth', linewidth=2)
-    axes[1].plot(pred_vel[:50, 0], 'r--', label='Predicted', linewidth=2)
+    axes[1].plot(test_next_vel[:n_plot, 0], 'b-', label='Ground Truth', linewidth=2)
+    axes[1].plot(pred_vel[:n_plot, 0], 'r--', label='Predicted', linewidth=2)
     axes[1].set_ylabel('Joint 0 Velocity [rad/s]')
     axes[1].set_xlabel('Sample Index')
     axes[1].set_title(f'{model_type} - Velocity Predictions')
@@ -204,6 +221,53 @@ def check_model_predictions(model, model_type, data, config):
     print(f"\nSaved prediction plot: figures/predictions_{model_type}.png")
     plt.close()
 
+def check_temporal_correlation(data):  # ✅ Takes data object, not path
+    """Check if history actually helps prediction"""
+    # data is already loaded NpzFile
+    
+    pos = data['train_positions']
+    vel = data['train_velocities']
+    tau = data['train_torques']
+    next_pos = data['train_next_positions']
+    
+    print("\n" + "="*60)
+    print("TEMPORAL CORRELATION CHECK")
+    print("="*60)
+    
+    # Check: Does past state correlate with current state?
+    for lag in [1, 5, 10]:
+        if lag < len(pos):
+            current = pos[lag:]
+            past = pos[:-lag]
+            
+            correlations = []
+            for i in range(7):
+                if len(current[:, i]) > 0 and len(past[:, i]) > 0:
+                    corr = np.corrcoef(current[:, i], past[:, i])[0, 1]
+                    correlations.append(corr)
+            
+            avg_correlation = np.mean(correlations)
+            print(f"\nPosition autocorrelation at lag {lag} steps ({lag*0.05:.2f}s):")
+            print(f"  Average: {avg_correlation:.3f}")
+            print(f"  Per joint: {[f'{c:.3f}' for c in correlations]}")
+    
+    # Check velocity autocorrelation
+    print("\n" + "-"*60)
+    for lag in [1, 5, 10]:
+        if lag < len(vel):
+            current = vel[lag:]
+            past = vel[:-lag]
+            
+            correlations = []
+            for i in range(7):
+                if len(current[:, i]) > 0 and len(past[:, i]) > 0:
+                    corr = np.corrcoef(current[:, i], past[:, i])[0, 1]
+                    correlations.append(corr)
+            
+            avg_correlation = np.mean(correlations)
+            print(f"\nVelocity autocorrelation at lag {lag} steps ({lag*0.05:.2f}s):")
+            print(f"  Average: {avg_correlation:.3f}")
+
 
 def main():
     """Run diagnostics"""
@@ -213,6 +277,8 @@ def main():
     
     # Check data
     data = check_data_quality('data/synthetic_dataset.npz')
+
+    check_temporal_correlation(data)
     
     # Load and check baseline model
     try:
@@ -229,7 +295,7 @@ def main():
     
     # Load and check transformer model
     try:
-        checkpoint = torch.load('models/trained/transformer/best.pth', map_location='cpu')
+        checkpoint = torch.load('models/trained/transformer/best.pth', map_location='cpu', weights_only=False)
         model_transformer = create_transformer_model(config)
         model_transformer.load_state_dict(checkpoint['model_state_dict'])
         

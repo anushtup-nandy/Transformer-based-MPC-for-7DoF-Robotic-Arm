@@ -1,7 +1,3 @@
-"""
-Training script for both Baseline DNN and Transformer models
-"""
-
 from matplotlib.pyplot import axis
 import torch
 import torch.nn as nn
@@ -22,14 +18,7 @@ from models.transformer_predictor import create_transformer_model
 
 class RobotDataset(Dataset):
     """Dataset for robot dynamics"""
-    
     def __init__(self, data_path, split='train', history_length=1):
-        """
-        Args:
-            data_path: Path to .npz file
-            split: 'train', 'val', or 'test'
-            history_length: Number of past timesteps (1 for DNN, >1 for Transformer)
-        """
         data = np.load(data_path)
         
         self.positions = data[f'{split}_positions']
@@ -40,7 +29,6 @@ class RobotDataset(Dataset):
         
         self.history_length = history_length
         
-        # For transformer, we need to create sequences
         if history_length > 1:
             self._create_sequences()
     
@@ -81,6 +69,22 @@ class RobotDataset(Dataset):
         }
 
 
+class WeightedMSELoss(nn.Module):
+    """MSE loss with separate weights for position and velocity"""
+    
+    def __init__(self, pos_weight=1.0, vel_weight=1.0):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+    
+    def forward(self, pred_pos, target_pos, pred_vel, target_vel):
+        loss_pos = torch.mean((pred_pos - target_pos) ** 2)
+        loss_vel = torch.mean((pred_vel - target_vel) ** 2)
+        
+        # Weight velocity loss less since it has much higher magnitude
+        return self.pos_weight * loss_pos + self.vel_weight * loss_vel
+
+
 class Trainer:
     """Trainer for robot dynamics models"""
     
@@ -96,17 +100,25 @@ class Trainer:
         
         # Setup optimizer
         train_config = config['training']
+        if model_type == 'transformer':
+            lr = train_config.get('transformer_lr', 0.0003)  # Lower LR
+            weight_decay = train_config.get('transformer_wd', 1e-4)  # More regularization
+        else:
+            lr = train_config.get('baseline_lr', 0.001)
+            weight_decay = train_config['weight_decay']
+        
         self.optimizer = optim.Adam(
             model.parameters(),
-            lr=train_config['learning_rate'],
-            weight_decay=train_config['weight_decay']
+            lr=lr,
+            weight_decay=weight_decay
         )
         
         # Setup learning rate scheduler
         self.setup_scheduler(train_config)
         
-        # Loss function
-        self.criterion = nn.MSELoss()
+        self.criterion = WeightedMSELoss(pos_weight=1.0, vel_weight=0.1)
+        
+        print(f"Using weighted loss: pos_weight=1.0, vel_weight=0.1")
         
         # Tensorboard
         if config['logging']['tensorboard']:
@@ -125,33 +137,41 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     def setup_scheduler(self, train_config):
-        """Setup learning rate scheduler"""
+        """Setup learning rate scheduler with warmup for transformer"""
         sched_config = train_config['scheduler']
         
-        if sched_config['type'] == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=train_config['num_epochs'],
-                eta_min=sched_config['min_lr']
-            )
-        elif sched_config['type'] == 'step':
-            self.scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=20,
-                gamma=0.5
-            )
-        elif sched_config['type'] == 'exponential':
-            self.scheduler = optim.lr_scheduler.ExponentialLR(
-                self.optimizer,
-                gamma=0.95
-            )
+        if self.model_type == 'transformer':
+            # ✅ Warmup + Cosine schedule
+            from torch.optim.lr_scheduler import LambdaLR
+            
+            warmup_epochs = sched_config.get('warmup_epochs', 5)
+            total_epochs = train_config['num_epochs']
+            
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    # Linear warmup
+                    return (epoch + 1) / warmup_epochs
+                else:
+                    # Cosine decay
+                    progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+                    return 0.5 * (1 + np.cos(np.pi * progress))
+            
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda)
         else:
-            self.scheduler = None
-    
+            # Baseline uses simple cosine
+            if sched_config['type'] == 'cosine':
+                self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=train_config['num_epochs'],
+                    eta_min=sched_config['min_lr']
+                )   
+
     def train_epoch(self, train_loader):
         """Train for one epoch"""
         self.model.train()
         total_loss = 0
+        total_pos_loss = 0
+        total_vel_loss = 0
         
         pbar = tqdm(train_loader, desc=f'Epoch {self.epoch+1}')
         for batch in pbar:
@@ -166,26 +186,29 @@ class Trainer:
             
             # Handle baseline vs transformer
             if self.model_type == 'baseline':
-                # Baseline: single timestep
                 if positions.dim() == 3:
                     positions = positions[:, -1, :]
                     velocities = velocities[:, -1, :]
                     torques = torques[:, -1, :]
                 
-                # Model outputs next_state (already handles normalization internally)
                 predicted_state = self.model(positions, velocities, torques)
             else:
-                # Transformer: sequence input (model handles normalization internally)
                 predicted_state = self.model(positions, velocities, torques)
             
             # Split predictions
             pred_positions = predicted_state[:, :7]
             pred_velocities = predicted_state[:, 7:]
             
-            # Compute loss on ABSOLUTE states (model already does residual internally)
-            loss_pos = self.criterion(pred_positions, next_positions)
-            loss_vel = self.criterion(pred_velocities, next_velocities)
-            loss = loss_pos + loss_vel
+            # Compute weighted loss
+            loss = self.criterion(pred_positions, next_positions, 
+                                pred_velocities, next_velocities)
+            
+            # Track separate losses for monitoring
+            with torch.no_grad():
+                pos_loss = torch.mean((pred_positions - next_positions) ** 2)
+                vel_loss = torch.mean((pred_velocities - next_velocities) ** 2)
+                total_pos_loss += pos_loss.item()
+                total_vel_loss += vel_loss.item()
             
             # Backward pass
             loss.backward()
@@ -193,14 +216,24 @@ class Trainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({
+                'loss': loss.item(),
+                'pos': pos_loss.item(),
+                'vel': vel_loss.item()
+            })
         
-        return total_loss / len(train_loader)  
+        avg_loss = total_loss / len(train_loader)
+        avg_pos_loss = total_pos_loss / len(train_loader)
+        avg_vel_loss = total_vel_loss / len(train_loader)
+        
+        return avg_loss, avg_pos_loss, avg_vel_loss
 
     def validate(self, val_loader):
         """Validate model"""
         self.model.eval()
         total_loss = 0
+        total_pos_loss = 0
+        total_vel_loss = 0
         
         with torch.no_grad():
             for batch in val_loader:
@@ -224,13 +257,21 @@ class Trainer:
                 pred_positions = predicted_state[:, :7]
                 pred_velocities = predicted_state[:, 7:]
                 
-                loss_pos = self.criterion(pred_positions, next_positions)
-                loss_vel = self.criterion(pred_velocities, next_velocities)
-                loss = loss_pos + loss_vel
+                loss = self.criterion(pred_positions, next_positions,
+                                    pred_velocities, next_velocities)
+                
+                pos_loss = torch.mean((pred_positions - next_positions) ** 2)
+                vel_loss = torch.mean((pred_velocities - next_velocities) ** 2)
                 
                 total_loss += loss.item()
+                total_pos_loss += pos_loss.item()
+                total_vel_loss += vel_loss.item()
         
-        return total_loss / len(val_loader)
+        avg_loss = total_loss / len(val_loader)
+        avg_pos_loss = total_pos_loss / len(val_loader)
+        avg_vel_loss = total_vel_loss / len(val_loader)
+        
+        return avg_loss, avg_pos_loss, avg_vel_loss
     
     def save_checkpoint(self, is_best=False):
         """Save model checkpoint"""
@@ -250,7 +291,7 @@ class Trainer:
         if is_best:
             path = self.checkpoint_dir / 'best.pth'
             torch.save(checkpoint, path)
-            print(f"  Saved best model with val_loss={self.best_val_loss:.6f}")
+            print(f"  ✓ Saved best model with val_loss={self.best_val_loss:.6f}")
     
     def train(self, train_loader, val_loader, num_epochs):
         """Full training loop"""
@@ -260,18 +301,23 @@ class Trainer:
             self.epoch = epoch
             
             # Train
-            train_loss = self.train_epoch(train_loader)
+            train_loss, train_pos, train_vel = self.train_epoch(train_loader)
             
             # Validate
-            val_loss = self.validate(val_loader)
+            val_loss, val_pos, val_vel = self.validate(val_loader)
             
             # Log
-            print(f"Epoch {epoch+1}/{num_epochs}: "
-                  f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+            print(f"Epoch {epoch+1}/{num_epochs}:")
+            print(f"  train_loss={train_loss:.6f} (pos={train_pos:.6f}, vel={train_vel:.6f})")
+            print(f"  val_loss={val_loss:.6f} (pos={val_pos:.6f}, vel={val_vel:.6f})")
             
             if self.writer:
                 self.writer.add_scalar('Loss/train', train_loss, epoch)
                 self.writer.add_scalar('Loss/val', val_loss, epoch)
+                self.writer.add_scalar('Loss/train_pos', train_pos, epoch)
+                self.writer.add_scalar('Loss/train_vel', train_vel, epoch)
+                self.writer.add_scalar('Loss/val_pos', val_pos, epoch)
+                self.writer.add_scalar('Loss/val_vel', val_vel, epoch)
                 self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
             
             # Learning rate scheduler
@@ -306,11 +352,9 @@ class Trainer:
 
 def main(args):
     """Main training function"""
-    # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Set random seed
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     
@@ -325,7 +369,7 @@ def main(args):
     train_dataset = RobotDataset(args.data_path, 'train', history_length)
     val_dataset = RobotDataset(args.data_path, 'val', history_length)
    
-    # Compute normalization statistics from TRAINING data only
+    # Compute normalization statistics
     if history_length == 1:
         pos_mean = train_dataset.positions.mean(axis=0)
         pos_std = train_dataset.positions.std(axis=0) + 1e-6
@@ -334,7 +378,6 @@ def main(args):
         tau_mean = train_dataset.torques.mean(axis=0)
         tau_std = train_dataset.torques.std(axis=0) + 1e-6
     else:
-        # For transformer with sequences, compute over all timesteps
         pos_mean = train_dataset.positions.reshape(-1, 7).mean(axis=0)
         pos_std = train_dataset.positions.reshape(-1, 7).std(axis=0) + 1e-6
         vel_mean = train_dataset.velocities.reshape(-1, 7).mean(axis=0)
@@ -344,15 +387,18 @@ def main(args):
 
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
-    print(f"Normalization stats computed:")
-    print(f"  pos_std: {pos_std}")
+    print(f"\nNormalization stats:")
     print(f"  vel_std: {vel_std}")
-    print(f"  tau_std: {tau_std}")
     
     # Create dataloaders
+    if args.model_type == 'transformer':
+        batch_size = config['training'].get('transformer_batch_size', 128)  # Bigger batches
+    else:
+        batch_size = config['training']['batch_size']
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
         num_workers=0
     )

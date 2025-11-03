@@ -89,20 +89,27 @@ class LearnedDynamicsMPC:
                 dq_next = next_state[0, 7:].cpu().numpy()
             else:
                 # Transformer: use history
+                print(f"history length:{len(self.position_history)}")
+                if len(self.position_history) >= 2:
+                    diff = np.max(np.abs(self.position_history[-1] - self.position_history[-2]))
+                    print(f"history variation: {diff:.6f}")
                 if len(self.position_history) < self.history_length:
-                    while len(self.position_history) < self.history_length:
-                        self.position_history.append(q.copy())
-                        self.velocity_history.append(dq.copy())
-                        self.torque_history.append(tau.copy())
+                    # For initialization, use zero padding or current state as best guess
+                    deficit = self.history_length - len(self.position_history)
+                    for _ in range(deficit):
+                        # Insert at beginning (older states)
+                        self.position_history.insert(0, q.copy())
+                        self.velocity_history.insert(0, np.zeros_like(dq))
+                        self.torque_history.insert(0, np.zeros_like(tau))
                 
+                # Create history tensors
                 hist_q = torch.FloatTensor(np.array(self.position_history)).unsqueeze(0).to(self.device)
                 hist_dq = torch.FloatTensor(np.array(self.velocity_history)).unsqueeze(0).to(self.device)
                 hist_tau = torch.FloatTensor(np.array(self.torque_history)).unsqueeze(0).to(self.device)
                 
                 next_state = self.model(hist_q, hist_dq, hist_tau)
                 q_next = next_state[0, :7].cpu().numpy()
-                dq_next = next_state[0, 7:].cpu().numpy()
-        
+                dq_next = next_state[0, 7:].cpu().numpy()        
         return q_next, dq_next
     
     def build_mpc(self):
@@ -153,6 +160,13 @@ class LearnedDynamicsMPC:
         # Extract states and controls
         states = X[:self.n_states].reshape(self.N + 1, 14)
         controls = X[self.n_states:].reshape(self.N, 7)
+
+        if self.model_type == 'transformer':
+            rollout_history_q = list(self.position_history)
+            rollout_history_dq = list(self.velocity_history)
+            rollout_history_tau = list(self.torque_history)
+            if len(rollout_history_q) < self.history_length:
+                raise RuntimeError(f"History not initialized! Length: {len(rollout_history_q)}, Expected: {self.history_length}")
         
         # Tracking cost
         cost = 0.0
@@ -193,13 +207,31 @@ class LearnedDynamicsMPC:
             dq_k = states[k, 7:]
             tau_k = controls[k]
             
-            # Predict next state
-            q_next_pred, dq_next_pred = self.predict_next_state_numpy(q_k, dq_k, tau_k)
-            next_state_pred = np.concatenate([q_next_pred, dq_next_pred])
+            if self.model_type == 'transformer':
+                # Build history tensor
+                hist_q = torch.FloatTensor(np.array(rollout_history_q)).unsqueeze(0).to(self.device)
+                hist_dq = torch.FloatTensor(np.array(rollout_history_dq)).unsqueeze(0).to(self.device)
+                hist_tau = torch.FloatTensor(np.array(rollout_history_tau)).unsqueeze(0).to(self.device)
+                
+                with torch.no_grad():
+                    next_state = self.model(hist_q, hist_dq, hist_tau)
+                    q_next_pred = next_state[0, :7].cpu().numpy()
+                    dq_next_pred = next_state[0, 7:].cpu().numpy()
+                
+                rollout_history_q.append(q_next_pred)
+                rollout_history_dq.append(dq_next_pred)
+                rollout_history_tau.append(tau_k)
+                if len(rollout_history_q) > self.history_length:
+                    rollout_history_q.pop(0)
+                    rollout_history_dq.pop(0)
+                    rollout_history_tau.pop(0)
+            else:
+                # Baseline prediction
+                q_next_pred, dq_next_pred = self.predict_next_state_numpy(q_k, dq_k, tau_k)
             
-            # Soft constraint: penalize deviation from predicted dynamics
+            next_state_pred = np.concatenate([q_next_pred, dq_next_pred])
             dynamics_error = states[k+1] - next_state_pred
-            cost += self.W_dynamics * np.dot(dynamics_error, dynamics_error)
+            cost += self.W_dynamics * np.dot(dynamics_error, dynamics_error) 
         
         # Soft bound penalties (quadratic barrier near bounds)
         margin = 0.1  # Start penalty when within 10% of bounds
@@ -276,7 +308,8 @@ class LearnedDynamicsMPC:
         """Single MPC control step"""
         # Prepare current state
         x_current = np.concatenate([q_current, dq_current])
-        
+
+                
         # Prepare reference trajectory
         if q_ref.ndim == 1:
             q_ref = np.tile(q_ref[:, None], (1, self.N + 1))
@@ -292,6 +325,15 @@ class LearnedDynamicsMPC:
         
         # Solve MPC
         tau, _ = self.solve(x_current, x_reference)
+
+        if self.model_type == 'transformer':
+            # Update with current state (this represents the "present")
+            # The optimization will use this as the base
+            if len(self.position_history) == 0 or \
+               not np.allclose(self.position_history[-1], q_current):
+                # Only update if this is new state
+                self.update_history(q_current, dq_current, tau)
+
         
         return tau
 
@@ -310,7 +352,7 @@ def load_trained_model(model_type, config):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"No trained model found at {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     

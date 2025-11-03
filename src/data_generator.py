@@ -1,9 +1,11 @@
+from math import tau
 import numpy as np
 import pybullet as p
 import pybullet_data
 import yaml
 from pathlib import Path
 from tqdm import tqdm
+from scipy.signal import savgol_filter
 
 
 class SimpleFourierDataGenerator:
@@ -123,7 +125,7 @@ class SimpleFourierDataGenerator:
             forces=torques
         )
     
-    def generate_fourier_torques(self, duration, num_freqs=8):
+    def generate_fourier_torques(self, duration, num_freqs=5):
         """
         Generate rich Fourier series torque trajectories
         
@@ -145,7 +147,7 @@ class SimpleFourierDataGenerator:
             # Generate multiple frequency components
             for k in range(1, num_freqs + 1):
                 # Different fundamental frequency for each joint
-                base_freq = 0.05 + 0.05 * joint  # 0.05 to 0.35 Hz
+                base_freq = 0.02 + 0.02 * joint 
                 freq = k * base_freq
                 
                 # Random amplitude (10-30% of max torque)
@@ -156,7 +158,7 @@ class SimpleFourierDataGenerator:
                 
                 # Add component
                 torques[:, joint] += amp * np.sin(2*np.pi*freq*t + phase)
-            
+                            
             print(f"  Joint {joint}: max={torques[:, joint].max():.1f} Nm, "
                   f"min={torques[:, joint].min():.1f} Nm")
         
@@ -193,11 +195,13 @@ class SimpleFourierDataGenerator:
             q, dq = self.get_state()
             data['positions'][i] = q
             data['velocities'][i] = dq
-            data['torques'][i] = torque_trajectory[i]
+            # data['torques'][i] = torque_trajectory[i]
+            tau_commanded = torque_trajectory[i]
             
             # Apply torque for multiple substeps
             for _ in range(self.substeps):
-                self.apply_torques(torque_trajectory[i])
+                # self.apply_torques(torque_trajectory[i])
+                self.apply_torques(tau_commanded)
                 p.stepSimulation()
                 
                 if self.gui:
@@ -208,6 +212,13 @@ class SimpleFourierDataGenerator:
             q_next, dq_next = self.get_state()
             data['next_positions'][i] = q_next
             data['next_velocities'][i] = dq_next
+
+        for joint in range(self.dof):
+            data['torques'][:, joint] = savgol_filter(
+                torque_trajectory[:, joint],
+                window_length=11,  # Must be odd
+                polyorder=3
+            )
         
         return data
     
@@ -228,90 +239,70 @@ class SimpleFourierDataGenerator:
         return noisy_data
     
     def generate_dataset(self, output_path="data/synthetic_dataset.npz"):
-        """Generate complete dataset with multiple trajectories"""
+        """Generate complete dataset preserving temporal structure"""
         num_trajectories = self.config['data']['num_trajectories']
         samples_per_traj = self.config['data']['samples_per_trajectory']
         duration = samples_per_traj * self.control_dt
         
-        all_data = {
-            'positions': [],
-            'velocities': [],
-            'torques': [],
-            'next_positions': [],
-            'next_velocities': []
-        }
-        
-        print(f"\n{'='*60}")
-        print(f"Generating {num_trajectories} trajectories")
-        print(f"Duration per trajectory: {duration}s")
-        print(f"{'='*60}")
+        # ✅ Store trajectories separately first
+        all_trajectories = []
         
         for traj_idx in range(num_trajectories):
             print(f"\n[Trajectory {traj_idx+1}/{num_trajectories}]")
             
-            # Generate Fourier torques
             torques = self.generate_fourier_torques(duration)
-            
-            # Simulate
             traj_data = self.simulate_trajectory(torques)
             
-            # Add noise (optional)
-            if self.config['data']['noise']['position_std'] > 0:
-                traj_data = self.add_realistic_noise(traj_data)
-            
-            # Accumulate
-            for key in all_data.keys():
-                all_data[key].append(traj_data[key])
+            # Store as dict
+            all_trajectories.append(traj_data)
         
-        # Stack all trajectories
-        for key in all_data.keys():
-            all_data[key] = np.vstack(all_data[key])
+        # ✅ Split TRAJECTORIES, not samples
+        num_train = int(0.7 * num_trajectories)
+        num_val = int(0.2 * num_trajectories)
         
-        total_samples = all_data['positions'].shape[0]
-        print(f"\n{'='*60}")
-        print(f"Total samples collected: {total_samples}")
-        print(f"{'='*60}")
+        # Shuffle trajectory indices (not samples!)
+        traj_indices = np.random.permutation(num_trajectories)
         
-        # Train/val/test split
-        train_frac = self.config['data']['split']['train']
-        val_frac = self.config['data']['split']['val']
+        train_traj_idx = traj_indices[:num_train]
+        val_traj_idx = traj_indices[num_train:num_train + num_val]
+        test_traj_idx = traj_indices[num_train + num_val:]
         
-        train_size = int(train_frac * total_samples)
-        val_size = int(val_frac * total_samples)
-        
-        indices = np.random.permutation(total_samples)
-        train_idx = indices[:train_size]
-        val_idx = indices[train_size:train_size + val_size]
-        test_idx = indices[train_size + val_size:]
+        # Stack trajectories preserving order within each
+        train_data = {key: np.vstack([all_trajectories[i][key] for i in train_traj_idx]) 
+                      for key in all_trajectories[0].keys()}
+        val_data = {key: np.vstack([all_trajectories[i][key] for i in val_traj_idx]) 
+                    for key in all_trajectories[0].keys()}
+        test_data = {key: np.vstack([all_trajectories[i][key] for i in test_traj_idx]) 
+                     for key in all_trajectories[0].keys()}
         
         # Save
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             output_path,
-            train_positions=all_data['positions'][train_idx],
-            train_velocities=all_data['velocities'][train_idx],
-            train_torques=all_data['torques'][train_idx],
-            train_next_positions=all_data['next_positions'][train_idx],
-            train_next_velocities=all_data['next_velocities'][train_idx],
-            val_positions=all_data['positions'][val_idx],
-            val_velocities=all_data['velocities'][val_idx],
-            val_torques=all_data['torques'][val_idx],
-            val_next_positions=all_data['next_positions'][val_idx],
-            val_next_velocities=all_data['next_velocities'][val_idx],
-            test_positions=all_data['positions'][test_idx],
-            test_velocities=all_data['velocities'][test_idx],
-            test_torques=all_data['torques'][test_idx],
-            test_next_positions=all_data['next_positions'][test_idx],
-            test_next_velocities=all_data['next_velocities'][test_idx]
+            train_positions=train_data['positions'],
+            train_velocities=train_data['velocities'],
+            train_torques=train_data['torques'],
+            train_next_positions=train_data['next_positions'],
+            train_next_velocities=train_data['next_velocities'],
+            val_positions=val_data['positions'],
+            val_velocities=val_data['velocities'],
+            val_torques=val_data['torques'],
+            val_next_positions=val_data['next_positions'],
+            val_next_velocities=val_data['next_velocities'],
+            test_positions=test_data['positions'],
+            test_velocities=test_data['velocities'],
+            test_torques=test_data['torques'],
+            test_next_positions=test_data['next_positions'],
+            test_next_velocities=test_data['next_velocities']
         )
         
         print(f"\n✓ Dataset saved to: {output_path}")
-        print(f"  Train: {len(train_idx)} samples")
-        print(f"  Val:   {len(val_idx)} samples")
-        print(f"  Test:  {len(test_idx)} samples")
+        print(f"  Train: {len(train_data['positions'])} samples from {num_train} trajectories")
+        print(f"  Val:   {len(val_data['positions'])} samples from {num_val} trajectories")
+        print(f"  Test:  {len(test_data['positions'])} samples from {len(test_traj_idx)} trajectories")
         
-        return output_path
-    
+        return output_path   
+
     def cleanup(self):
         """Disconnect PyBullet"""
         p.disconnect(self.client)

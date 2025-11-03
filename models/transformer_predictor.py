@@ -189,76 +189,76 @@ class TransformerPredictor(nn.Module):
         return None
 
 
-class TransformerPredictorSingleStep(nn.Module):
-    """
-    Wrapper for single-step prediction compatible with MPC
-    Maintains internal buffer for history
-    """
-    
-    def __init__(self, transformer_model, history_length):
-        super(TransformerPredictorSingleStep, self).__init__()
-        
-        self.transformer = transformer_model
-        self.history_length = history_length
-        self.dof = transformer_model.dof
-        
-        # Initialize history buffers
-        self.reset_history()
-    
-    def reset_history(self):
-        """Reset history buffers"""
-        self.position_history = []
-        self.velocity_history = []
-        self.torque_history = []
-    
-    def update_history(self, positions, velocities, torques):
-        """
-        Update history with new state
-        
-        Args:
-            positions: (7,) or (batch, 7)
-            velocities: (7,) or (batch, 7)
-            torques: (7,) or (batch, 7)
-        """
-        # Ensure inputs are 2D
-        if positions.dim() == 1:
-            positions = positions.unsqueeze(0)
-            velocities = velocities.unsqueeze(0)
-            torques = torques.unsqueeze(0)
-        
-        self.position_history.append(positions)
-        self.velocity_history.append(velocities)
-        self.torque_history.append(torques)
-
-        # Normalization statistics (compute from training data)
-        self.register_buffer('pos_mean', torch.zeros(7))
-        self.register_buffer('pos_std', torch.ones(7))
-        self.register_buffer('vel_mean', torch.zeros(7))
-        self.register_buffer('vel_std', torch.ones(7))
-        self.register_buffer('tau_mean', torch.zeros(7))
-        self.register_buffer('tau_std', torch.ones(7))
-        
-        # Keep only recent history
-        if len(self.position_history) > self.history_length:
-            self.position_history.pop(0)
-            self.velocity_history.pop(0)
-            self.torque_history.pop(0)
-    
-    def forward(self, history_positions, history_velocities, history_torques):
-        """Forward pass - predicts CHANGE in state"""
-        # Normalize inputs
-        pos_norm = (positions - self.pos_mean) / (self.pos_std + 1e-6)
-        vel_norm = (velocities - self.vel_mean) / (self.vel_std + 1e-6)
-        tau_norm = (torques - self.tau_mean) / (self.tau_std + 1e-6)
-        
-        x = torch.cat([pos_norm, vel_norm, tau_norm], dim=-1)
-        delta_state = self.network(x)
-        
-        # Denormalize outputs
-        delta_pos = delta_state[..., :7] * self.pos_std
-        delta_vel = delta_state[..., 7:] * self.vel_std
-        
-        return torch.cat([positions + delta_pos, velocities + delta_vel], dim=-1)
+# class TransformerPredictorSingleStep(nn.Module):
+#     """
+#     Wrapper for single-step prediction compatible with MPC
+#     Maintains internal buffer for history
+#     """
+#     
+#     def __init__(self, transformer_model, history_length):
+#         super(TransformerPredictorSingleStep, self).__init__()
+#         
+#         self.transformer = transformer_model
+#         self.history_length = history_length
+#         self.dof = transformer_model.dof
+#         
+#         # Initialize history buffers
+#         self.reset_history()
+#     
+#     def reset_history(self):
+#         """Reset history buffers"""
+#         self.position_history = []
+#         self.velocity_history = []
+#         self.torque_history = []
+#     
+#     def update_history(self, positions, velocities, torques):
+#         """
+#         Update history with new state
+#         
+#         Args:
+#             positions: (7,) or (batch, 7)
+#             velocities: (7,) or (batch, 7)
+#             torques: (7,) or (batch, 7)
+#         """
+#         # Ensure inputs are 2D
+#         if positions.dim() == 1:
+#             positions = positions.unsqueeze(0)
+#             velocities = velocities.unsqueeze(0)
+#             torques = torques.unsqueeze(0)
+#         
+#         self.position_history.append(positions)
+#         self.velocity_history.append(velocities)
+#         self.torque_history.append(torques)
+#
+#         # Normalization statistics (compute from training data)
+#         self.register_buffer('pos_mean', torch.zeros(7))
+#         self.register_buffer('pos_std', torch.ones(7))
+#         self.register_buffer('vel_mean', torch.zeros(7))
+#         self.register_buffer('vel_std', torch.ones(7))
+#         self.register_buffer('tau_mean', torch.zeros(7))
+#         self.register_buffer('tau_std', torch.ones(7))
+#         
+#         # Keep only recent history
+#         if len(self.position_history) > self.history_length:
+#             self.position_history.pop(0)
+#             self.velocity_history.pop(0)
+#             self.torque_history.pop(0)
+#     
+#     def forward(self, history_positions, history_velocities, history_torques):
+#         """Forward pass - predicts CHANGE in state"""
+#         # Normalize inputs
+#         pos_norm = (positions - self.pos_mean) / (self.pos_std + 1e-6)
+#         vel_norm = (velocities - self.vel_mean) / (self.vel_std + 1e-6)
+#         tau_norm = (torques - self.tau_mean) / (self.tau_std + 1e-6)
+#         
+#         x = torch.cat([pos_norm, vel_norm, tau_norm], dim=-1)
+#         delta_state = self.network(x)
+#         
+#         # Denormalize outputs
+#         delta_pos = delta_state[..., :7] * self.pos_std
+#         delta_vel = delta_state[..., 7:] * self.vel_std
+#         
+#         return torch.cat([positions + delta_pos, velocities + delta_vel], dim=-1)
 
 def create_transformer_model(config):
     """Factory function to create transformer model"""
