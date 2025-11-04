@@ -260,41 +260,45 @@ class MPCEvaluator:
     
     def plot_comparison(self, results_baseline, results_transformer, scenario_name):
         """Compare baseline vs transformer"""
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        # Create figure with more subplots for all joints
+        fig = plt.figure(figsize=(18, 12))
         
         t = np.arange(results_baseline['q'].shape[1]) * self.dt
         
-        # Joint 1 tracking
-        axes[0, 0].plot(t, results_baseline['q_ref'][0, :], 'k--', 
-                       label='Reference', linewidth=2)
-        axes[0, 0].plot(t, results_baseline['q'][0, :], 'b-', 
-                       label='Baseline DNN', linewidth=1.5, alpha=0.7)
-        axes[0, 0].plot(t, results_transformer['q'][0, :], 'r-', 
-                       label='Transformer', linewidth=1.5, alpha=0.7)
-        axes[0, 0].set_xlabel('Time [s]')
-        axes[0, 0].set_ylabel('Joint 1 Position [rad]')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True)
-        axes[0, 0].set_title('Joint 1 Tracking')
+        # Plot all 7 joints
+        for joint_idx in range(self.dof):
+            ax = plt.subplot(3, 3, joint_idx + 1)
+            ax.plot(t, results_baseline['q_ref'][joint_idx, :], 'k--', 
+                   label='Reference', linewidth=2, alpha=0.5)
+            ax.plot(t, results_baseline['q'][joint_idx, :], 'b-', 
+                   label='Baseline DNN', linewidth=1.5, alpha=0.7)
+            ax.plot(t, results_transformer['q'][joint_idx, :], 'r-', 
+                   label='Transformer', linewidth=1.5, alpha=0.7)
+            ax.set_xlabel('Time [s]')
+            ax.set_ylabel(f'Joint {joint_idx+1} [rad]')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f'Joint {joint_idx+1} Tracking')
         
-        # Tracking error
+        # Total tracking error (subplot 8)
+        ax = plt.subplot(3, 3, 8)
         error_baseline = np.linalg.norm(
             results_baseline['q'] - results_baseline['q_ref'], axis=0
         )
         error_transformer = np.linalg.norm(
             results_transformer['q'] - results_transformer['q_ref'], axis=0
         )
+        ax.plot(t, error_baseline, 'b-', label='Baseline DNN', linewidth=1.5)
+        ax.plot(t, error_transformer, 'r-', label='Transformer', linewidth=1.5)
+        ax.set_xlabel('Time [s]')
+        ax.set_ylabel('Total Error [rad]')
+        ax.legend()
+        ax.grid(True)
+        ax.set_title('Total Tracking Error')
+        ax.set_yscale('log')
         
-        axes[0, 1].plot(t, error_baseline, 'b-', label='Baseline DNN', linewidth=1.5)
-        axes[0, 1].plot(t, error_transformer, 'r-', label='Transformer', linewidth=1.5)
-        axes[0, 1].set_xlabel('Time [s]')
-        axes[0, 1].set_ylabel('Tracking Error [rad]')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True)
-        axes[0, 1].set_title('Total Tracking Error')
-        axes[0, 1].set_yscale('log')
-        
-        # Metrics comparison
+        # Metrics comparison (subplot 9)
+        ax = plt.subplot(3, 3, 9)
         metrics_baseline = results_baseline['metrics']
         metrics_transformer = results_transformer['metrics']
         
@@ -305,34 +309,22 @@ class MPCEvaluator:
         x = np.arange(len(metric_names))
         width = 0.35
         
-        axes[1, 0].bar(x - width/2, baseline_values, width, label='Baseline DNN')
-        axes[1, 0].bar(x + width/2, transformer_values, width, label='Transformer')
-        axes[1, 0].set_ylabel('Error')
-        axes[1, 0].set_xticks(x)
-        axes[1, 0].set_xticklabels([m.upper() for m in metric_names])
-        axes[1, 0].legend()
-        axes[1, 0].set_title('Performance Metrics')
-        axes[1, 0].set_yscale('log')
-        axes[1, 0].grid(True, axis='y')
+        ax.bar(x - width/2, baseline_values, width, label='Baseline DNN')
+        ax.bar(x + width/2, transformer_values, width, label='Transformer')
+        ax.set_ylabel('Error')
+        ax.set_xticks(x)
+        ax.set_xticklabels([m.upper() for m in metric_names], fontsize=8)
+        ax.legend()
+        ax.set_title('Performance Metrics')
+        ax.set_yscale('log')
+        ax.grid(True, axis='y', alpha=0.3)
         
-        # Control effort
-        control_baseline = np.sum(results_baseline['tau'] ** 2, axis=0)
-        control_transformer = np.sum(results_transformer['tau'] ** 2, axis=0)
-        
-        axes[1, 1].plot(t, control_baseline, 'b-', label='Baseline DNN', linewidth=1.5)
-        axes[1, 1].plot(t, control_transformer, 'r-', label='Transformer', linewidth=1.5)
-        axes[1, 1].set_xlabel('Time [s]')
-        axes[1, 1].set_ylabel('Control Effort [Nm²]')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True)
-        axes[1, 1].set_title('Control Effort')
-        
-        plt.suptitle(f'Comparison: {scenario_name}', fontsize=14, fontweight='bold')
+        plt.suptitle(f'Comparison: {scenario_name}', fontsize=16, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(self.fig_dir / f"comparison_{scenario_name}.png", 
+        plt.savefig(self.fig_dir / f"comparison_{scenario_name}_all_joints.png", 
                    dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"✓ Saved plot: {self.fig_dir / f'comparison_{scenario_name}.png'}")
+        print(f"✓ Saved plot: {self.fig_dir / f'comparison_{scenario_name}_all_joints.png'}") 
     
     def cleanup(self):
         """Cleanup resources"""

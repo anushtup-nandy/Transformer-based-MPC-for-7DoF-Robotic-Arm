@@ -105,14 +105,14 @@ training:
 
 # MPC Parameters
 mpc:
-  prediction_horizon: 8
+  prediction_horizon: 12 # 8
   control_horizon: 8
   sampling_time: 0.05  # 50ms
   
   # Cost function weights
   weights:
-    state: 100.0  # W1
-    control: 0.01  # W2
+    state: 150.0  # W1 100
+    control: 0.005  # W2 0.01
   
   # Solver options
   solver:
