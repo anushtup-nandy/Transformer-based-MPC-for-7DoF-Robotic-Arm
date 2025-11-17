@@ -1,4 +1,4 @@
-from matplotlib.pyplot import axis
+from matplotlib.pyplot import axis  # (kept from your original)
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,268 +11,280 @@ import sys
 from tqdm import tqdm
 import argparse
 
+# allow "models" to be importable
 sys.path.append(str(Path(__file__).parent.parent))
+
 from models.baseline_dnn import create_baseline_model
 from models.transformer_predictor import create_transformer_model
+from models.lstm_predictor import create_lstm_model
 
+
+# --------------------------- Data ---------------------------
 
 class RobotDataset(Dataset):
     """Dataset for robot dynamics"""
     def __init__(self, data_path, split='train', history_length=1):
         data = np.load(data_path)
-        
-        self.positions = data[f'{split}_positions']
-        self.velocities = data[f'{split}_velocities']
-        self.torques = data[f'{split}_torques']
-        self.next_positions = data[f'{split}_next_positions']
+
+        self.positions       = data[f'{split}_positions']
+        self.velocities      = data[f'{split}_velocities']
+        self.torques         = data[f'{split}_torques']
+        self.next_positions  = data[f'{split}_next_positions']
         self.next_velocities = data[f'{split}_next_velocities']
-        
+
         self.history_length = history_length
-        
         if history_length > 1:
             self._create_sequences()
-    
+
     def _create_sequences(self):
-        """Create sequences for transformer training"""
+        """Create sequences for sequence models (transformer/LSTM)"""
         n_samples = len(self.positions)
         n_sequences = n_samples - self.history_length + 1
-        
-        pos_seq = np.zeros((n_sequences, self.history_length, 7))
-        vel_seq = np.zeros((n_sequences, self.history_length, 7))
-        tau_seq = np.zeros((n_sequences, self.history_length, 7))
+
+        pos_seq  = np.zeros((n_sequences, self.history_length, 7))
+        vel_seq  = np.zeros((n_sequences, self.history_length, 7))
+        tau_seq  = np.zeros((n_sequences, self.history_length, 7))
         next_pos = np.zeros((n_sequences, 7))
         next_vel = np.zeros((n_sequences, 7))
-        
+
         for i in range(n_sequences):
-            pos_seq[i] = self.positions[i:i+self.history_length]
-            vel_seq[i] = self.velocities[i:i+self.history_length]
-            tau_seq[i] = self.torques[i:i+self.history_length]
+            pos_seq[i]  = self.positions[i:i+self.history_length]
+            vel_seq[i]  = self.velocities[i:i+self.history_length]
+            tau_seq[i]  = self.torques[i:i+self.history_length]
             next_pos[i] = self.next_positions[i+self.history_length-1]
             next_vel[i] = self.next_velocities[i+self.history_length-1]
-        
-        self.positions = pos_seq
-        self.velocities = vel_seq
-        self.torques = tau_seq
-        self.next_positions = next_pos
+
+        self.positions       = pos_seq
+        self.velocities      = vel_seq
+        self.torques         = tau_seq
+        self.next_positions  = next_pos
         self.next_velocities = next_vel
-    
+
     def __len__(self):
         return len(self.positions)
-    
+
     def __getitem__(self, idx):
         return {
-            'positions': torch.FloatTensor(self.positions[idx]),
-            'velocities': torch.FloatTensor(self.velocities[idx]),
-            'torques': torch.FloatTensor(self.torques[idx]),
-            'next_positions': torch.FloatTensor(self.next_positions[idx]),
-            'next_velocities': torch.FloatTensor(self.next_velocities[idx])
+            'positions':       torch.FloatTensor(self.positions[idx]),
+            'velocities':      torch.FloatTensor(self.velocities[idx]),
+            'torques':         torch.FloatTensor(self.torques[idx]),
+            'next_positions':  torch.FloatTensor(self.next_positions[idx]),
+            'next_velocities': torch.FloatTensor(self.next_velocities[idx]),
         }
 
 
+# --------------------------- Loss ---------------------------
+
 class WeightedMSELoss(nn.Module):
     """MSE loss with separate weights for position and velocity"""
-    
     def __init__(self, pos_weight=1.0, vel_weight=1.0):
         super().__init__()
         self.pos_weight = pos_weight
         self.vel_weight = vel_weight
-    
+
     def forward(self, pred_pos, target_pos, pred_vel, target_vel):
         loss_pos = torch.mean((pred_pos - target_pos) ** 2)
         loss_vel = torch.mean((pred_vel - target_vel) ** 2)
-        
-        # Weight velocity loss less since it has much higher magnitude
         return self.pos_weight * loss_pos + self.vel_weight * loss_vel
 
 
+# --------------------------- Trainer ---------------------------
+
 class Trainer:
     """Trainer for robot dynamics models"""
-    
     def __init__(self, model, config, model_type='baseline'):
         self.model = model
         self.config = config
         self.model_type = model_type
-        
-        # Setup device
-        self.device = torch.device('mps' if torch.mps.is_available() else 'cpu')
+
+        # Device
+        # (Your environment is CPU; keep it simple and predictable)
+        self.device = torch.device('cpu')
         self.model.to(self.device)
         print(f"Training on device: {self.device}")
-        
-        # Setup optimizer
+
+        # Optimizer
         train_config = config['training']
         if model_type == 'transformer':
-            lr = train_config.get('transformer_lr', 0.0003)  # Lower LR
-            weight_decay = train_config.get('transformer_wd', 1e-4)  # More regularization
+            lr = train_config.get('transformer_lr', 3e-4)
+            weight_decay = train_config.get('transformer_wd', 1e-4)
+        elif model_type == 'lstm':
+            lr = train_config.get('lstm_lr', train_config.get('baseline_lr', 1e-3))
+            weight_decay = train_config.get('lstm_wd', train_config['weight_decay'])
         else:
-            lr = train_config.get('baseline_lr', 0.001)
+            lr = train_config.get('baseline_lr', 1e-3)
             weight_decay = train_config['weight_decay']
-        
-        self.optimizer = optim.Adam(
-            model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay
-        )
-        
-        # Setup learning rate scheduler
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.scheduler = None
         self.setup_scheduler(train_config)
-        
+
+        # Weighted loss (lower weight on velocity due to scale)
         self.criterion = WeightedMSELoss(pos_weight=1.0, vel_weight=0.1)
-        
-        print(f"Using weighted loss: pos_weight=1.0, vel_weight=0.1")
-        
-        # Tensorboard
+        print("Using WeightedMSELoss(pos=1.0, vel=0.1)")
+
+        # TensorBoard
         if config['logging']['tensorboard']:
             log_dir = Path(config['logging']['log_dir']) / model_type
             self.writer = SummaryWriter(log_dir)
         else:
             self.writer = None
-        
-        # Training state
+
+        # State
         self.epoch = 0
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        
-        # Create checkpoint directory
+
+        # Checkpoint dir
         self.checkpoint_dir = Path('models/trained') / model_type
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def setup_scheduler(self, train_config):
-        """Setup learning rate scheduler with warmup for transformer"""
-        sched_config = train_config['scheduler']
-        
+        """LR schedulers (warmup+cosine for transformer; cosine for others when configured)"""
+        sched_config = train_config.get('scheduler', {'type': 'cosine', 'min_lr': 1e-6, 'warmup_epochs': 5})
         if self.model_type == 'transformer':
-            # ✅ Warmup + Cosine schedule
             from torch.optim.lr_scheduler import LambdaLR
-            
-            warmup_epochs = sched_config.get('warmup_epochs', 5)
-            total_epochs = train_config['num_epochs']
-            
+            warm = sched_config.get('warmup_epochs', 5)
+            total = train_config['num_epochs']
+
             def lr_lambda(epoch):
-                if epoch < warmup_epochs:
-                    # Linear warmup
-                    return (epoch + 1) / warmup_epochs
-                else:
-                    # Cosine decay
-                    progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-                    return 0.5 * (1 + np.cos(np.pi * progress))
-            
+                if epoch < warm:
+                    return (epoch + 1) / max(1, warm)
+                # cosine decay
+                progress = (epoch - warm) / max(1, (total - warm))
+                return 0.5 * (1 + np.cos(np.pi * progress))
+
             self.scheduler = LambdaLR(self.optimizer, lr_lambda)
         else:
-            # Baseline uses simple cosine
-            if sched_config['type'] == 'cosine':
+            if sched_config.get('type', 'cosine') == 'cosine':
                 self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                     self.optimizer,
                     T_max=train_config['num_epochs'],
-                    eta_min=sched_config['min_lr']
-                )   
+                    eta_min=sched_config.get('min_lr', 1e-6)
+                )
 
     def train_epoch(self, train_loader):
         """Train for one epoch"""
         self.model.train()
-        total_loss = 0
-        total_pos_loss = 0
-        total_vel_loss = 0
-        
+        total_loss = 0.0
+        total_pos_loss = 0.0
+        total_vel_loss = 0.0
+
         pbar = tqdm(train_loader, desc=f'Epoch {self.epoch+1}')
         for batch in pbar:
-            # Move to device
-            positions = batch['positions'].to(self.device)
-            velocities = batch['velocities'].to(self.device)
-            torques = batch['torques'].to(self.device)
-            next_positions = batch['next_positions'].to(self.device)
+            positions       = batch['positions'].to(self.device)
+            velocities      = batch['velocities'].to(self.device)
+            torques         = batch['torques'].to(self.device)
+            next_positions  = batch['next_positions'].to(self.device)
             next_velocities = batch['next_velocities'].to(self.device)
-            
+
             self.optimizer.zero_grad()
-            
-            # Handle baseline vs transformer
+
+            # ----- model-type specific forward -----
             if self.model_type == 'baseline':
+                # use last step only; ensure shape (B,7)
                 if positions.dim() == 3:
-                    positions = positions[:, -1, :]
+                    positions  = positions[:,  -1, :]
                     velocities = velocities[:, -1, :]
-                    torques = torques[:, -1, :]
-                
+                    torques    = torques[:,    -1, :]
                 predicted_state = self.model(positions, velocities, torques)
+
+            elif self.model_type == 'transformer':
+                # pass three sequences (B,T,7)
+                predicted_state = self.model(positions, velocities, torques)
+
+            elif self.model_type == 'lstm':
+                # concatenate into (B,T,21)
+                if positions.dim() == 2:
+                    positions  = positions.unsqueeze(1)
+                    velocities = velocities.unsqueeze(1)
+                    torques    = torques.unsqueeze(1)
+                x_seq = torch.cat([positions, velocities, torques], dim=-1)  # (B,T,21)
+                predicted_state = self.model(x_seq)
+
             else:
-                predicted_state = self.model(positions, velocities, torques)
-            
+                raise ValueError(f"Unknown model_type: {self.model_type}")
+
             # Split predictions
-            pred_positions = predicted_state[:, :7]
+            pred_positions  = predicted_state[:, :7]
             pred_velocities = predicted_state[:, 7:]
-            
-            # Compute weighted loss
-            loss = self.criterion(pred_positions, next_positions, 
-                                pred_velocities, next_velocities)
-            
-            # Track separate losses for monitoring
+
+            # Weighted loss
+            loss = self.criterion(pred_positions, next_positions,
+                                  pred_velocities, next_velocities)
+
+            # Log components
             with torch.no_grad():
                 pos_loss = torch.mean((pred_positions - next_positions) ** 2)
                 vel_loss = torch.mean((pred_velocities - next_velocities) ** 2)
                 total_pos_loss += pos_loss.item()
                 total_vel_loss += vel_loss.item()
-            
-            # Backward pass
+
+            # Backprop
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
-            
+
             total_loss += loss.item()
-            pbar.set_postfix({
-                'loss': loss.item(),
-                'pos': pos_loss.item(),
-                'vel': vel_loss.item()
-            })
-        
-        avg_loss = total_loss / len(train_loader)
-        avg_pos_loss = total_pos_loss / len(train_loader)
-        avg_vel_loss = total_vel_loss / len(train_loader)
-        
-        return avg_loss, avg_pos_loss, avg_vel_loss
+            pbar.set_postfix({'loss': loss.item(),
+                              'pos':  pos_loss.item(),
+                              'vel':  vel_loss.item()})
+
+        n = len(train_loader)
+        return total_loss / n, total_pos_loss / n, total_vel_loss / n
 
     def validate(self, val_loader):
         """Validate model"""
         self.model.eval()
-        total_loss = 0
-        total_pos_loss = 0
-        total_vel_loss = 0
-        
+        total_loss = 0.0
+        total_pos_loss = 0.0
+        total_vel_loss = 0.0
+
         with torch.no_grad():
             for batch in val_loader:
-                positions = batch['positions'].to(self.device)
-                velocities = batch['velocities'].to(self.device)
-                torques = batch['torques'].to(self.device)
-                next_positions = batch['next_positions'].to(self.device)
+                positions       = batch['positions'].to(self.device)
+                velocities      = batch['velocities'].to(self.device)
+                torques         = batch['torques'].to(self.device)
+                next_positions  = batch['next_positions'].to(self.device)
                 next_velocities = batch['next_velocities'].to(self.device)
-                
-                # Forward pass
+
                 if self.model_type == 'baseline':
                     if positions.dim() == 3:
-                        positions = positions[:, -1, :]
+                        positions  = positions[:,  -1, :]
                         velocities = velocities[:, -1, :]
-                        torques = torques[:, -1, :]
-                    
+                        torques    = torques[:,    -1, :]
                     predicted_state = self.model(positions, velocities, torques)
+
+                elif self.model_type == 'transformer':
+                    predicted_state = self.model(positions, velocities, torques)
+
+                elif self.model_type == 'lstm':
+                    if positions.dim() == 2:
+                        positions  = positions.unsqueeze(1)
+                        velocities = velocities.unsqueeze(1)
+                        torques    = torques.unsqueeze(1)
+                    x_seq = torch.cat([positions, velocities, torques], dim=-1)  # (B,T,21)
+                    predicted_state = self.model(x_seq)
+
                 else:
-                    predicted_state = self.model(positions, velocities, torques)
-                
-                pred_positions = predicted_state[:, :7]
+                    raise ValueError(f"Unknown model_type: {self.model_type}")
+
+                pred_positions  = predicted_state[:, :7]
                 pred_velocities = predicted_state[:, 7:]
-                
+
                 loss = self.criterion(pred_positions, next_positions,
-                                    pred_velocities, next_velocities)
-                
+                                      pred_velocities, next_velocities)
+
                 pos_loss = torch.mean((pred_positions - next_positions) ** 2)
                 vel_loss = torch.mean((pred_velocities - next_velocities) ** 2)
-                
-                total_loss += loss.item()
+
+                total_loss     += loss.item()
                 total_pos_loss += pos_loss.item()
                 total_vel_loss += vel_loss.item()
-        
-        avg_loss = total_loss / len(val_loader)
-        avg_pos_loss = total_pos_loss / len(val_loader)
-        avg_vel_loss = total_vel_loss / len(val_loader)
-        
-        return avg_loss, avg_pos_loss, avg_vel_loss
-    
+
+        n = len(val_loader)
+        return total_loss / n, total_pos_loss / n, total_vel_loss / n
+
     def save_checkpoint(self, is_best=False):
         """Save model checkpoint"""
         checkpoint = {
@@ -282,151 +294,142 @@ class Trainer:
             'best_val_loss': self.best_val_loss,
             'config': self.config
         }
-        
-        # Save latest
-        path = self.checkpoint_dir / 'latest.pth'
-        torch.save(checkpoint, path)
-        
-        # Save best
+
+        latest_path = self.checkpoint_dir / 'latest.pth'
+        torch.save(checkpoint, latest_path)
+
         if is_best:
-            path = self.checkpoint_dir / 'best.pth'
-            torch.save(checkpoint, path)
+            best_path = self.checkpoint_dir / 'best.pth'
+            torch.save(checkpoint, best_path)
             print(f"  ✓ Saved best model with val_loss={self.best_val_loss:.6f}")
-    
+
     def train(self, train_loader, val_loader, num_epochs):
         """Full training loop"""
         train_config = self.config['training']
-        
+
         for epoch in range(num_epochs):
             self.epoch = epoch
-            
+
             # Train
             train_loss, train_pos, train_vel = self.train_epoch(train_loader)
-            
+
             # Validate
             val_loss, val_pos, val_vel = self.validate(val_loader)
-            
+
             # Log
             print(f"Epoch {epoch+1}/{num_epochs}:")
             print(f"  train_loss={train_loss:.6f} (pos={train_pos:.6f}, vel={train_vel:.6f})")
-            print(f"  val_loss={val_loss:.6f} (pos={val_pos:.6f}, vel={val_vel:.6f})")
-            
+            print(f"  val_loss={val_loss:.6f}   (pos={val_pos:.6f},  vel={val_vel:.6f})")
+
             if self.writer:
                 self.writer.add_scalar('Loss/train', train_loss, epoch)
-                self.writer.add_scalar('Loss/val', val_loss, epoch)
+                self.writer.add_scalar('Loss/val',   val_loss, epoch)
                 self.writer.add_scalar('Loss/train_pos', train_pos, epoch)
                 self.writer.add_scalar('Loss/train_vel', train_vel, epoch)
-                self.writer.add_scalar('Loss/val_pos', val_pos, epoch)
-                self.writer.add_scalar('Loss/val_vel', val_vel, epoch)
+                self.writer.add_scalar('Loss/val_pos',   val_pos,   epoch)
+                self.writer.add_scalar('Loss/val_vel',   val_vel,   epoch)
                 self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
-            
-            # Learning rate scheduler
-            if self.scheduler:
+
+            # Scheduler
+            if self.scheduler is not None:
                 self.scheduler.step()
-            
-            # Save checkpoint
+
+            # Save checkpoints
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-            
-            if train_config['save_best'] and is_best:
+
+            if train_config.get('save_best', True) and is_best:
                 self.save_checkpoint(is_best=True)
-            
-            if (epoch + 1) % train_config['save_every'] == 0:
+
+            if (epoch + 1) % train_config.get('save_every', 10) == 0:
                 self.save_checkpoint()
-            
+
             # Early stopping
-            early_stop_config = train_config['early_stopping']
-            if self.patience_counter >= early_stop_config['patience']:
+            early = train_config.get('early_stopping', {'patience': 50})
+            if self.patience_counter >= early.get('patience', 50):
                 print(f"\nEarly stopping triggered after {epoch+1} epochs")
                 break
-        
+
         if self.writer:
             self.writer.close()
-        
+
         print(f"\nTraining complete! Best val_loss: {self.best_val_loss:.6f}")
 
+
+# --------------------------- Main ---------------------------
 
 def main(args):
     """Main training function"""
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
-    
+
     # Determine history length
     if args.model_type == 'baseline':
         history_length = 1
     else:
+        # Use the same history_length for transformer and lstm
         history_length = config['transformer']['history_length']
-    
-    # Create datasets
+
+    # Datasets
     print(f"\nLoading data from {args.data_path}")
     train_dataset = RobotDataset(args.data_path, 'train', history_length)
-    val_dataset = RobotDataset(args.data_path, 'val', history_length)
-   
-    # Compute normalization statistics
-    if history_length == 1:
-        pos_mean = train_dataset.positions.mean(axis=0)
-        pos_std = train_dataset.positions.std(axis=0) + 1e-6
-        vel_mean = train_dataset.velocities.mean(axis=0)
-        vel_std = train_dataset.velocities.std(axis=0) + 1e-6
-        tau_mean = train_dataset.torques.mean(axis=0)
-        tau_std = train_dataset.torques.std(axis=0) + 1e-6
-    else:
-        pos_mean = train_dataset.positions.reshape(-1, 7).mean(axis=0)
-        pos_std = train_dataset.positions.reshape(-1, 7).std(axis=0) + 1e-6
-        vel_mean = train_dataset.velocities.reshape(-1, 7).mean(axis=0)
-        vel_std = train_dataset.velocities.reshape(-1, 7).std(axis=0) + 1e-6
-        tau_mean = train_dataset.torques.reshape(-1, 7).mean(axis=0)
-        tau_std = train_dataset.torques.reshape(-1, 7).std(axis=0) + 1e-6
+    val_dataset   = RobotDataset(args.data_path, 'val',   history_length)
 
     print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
-    print(f"\nNormalization stats:")
+    print(f"Val samples:   {len(val_dataset)}")
+
+    # Normalization stats (match shapes for history/no-history)
+    if history_length == 1:
+        pos_mean = train_dataset.positions.mean(axis=0); pos_std = train_dataset.positions.std(axis=0) + 1e-6
+        vel_mean = train_dataset.velocities.mean(axis=0); vel_std = train_dataset.velocities.std(axis=0) + 1e-6
+        tau_mean = train_dataset.torques.mean(axis=0);    tau_std = train_dataset.torques.std(axis=0) + 1e-6
+    else:
+        pos_mean = train_dataset.positions.reshape(-1, 7).mean(axis=0); pos_std = train_dataset.positions.reshape(-1, 7).std(axis=0) + 1e-6
+        vel_mean = train_dataset.velocities.reshape(-1, 7).mean(axis=0); vel_std = train_dataset.velocities.reshape(-1, 7).std(axis=0) + 1e-6
+        tau_mean = train_dataset.torques.reshape(-1, 7).mean(axis=0);    tau_std = train_dataset.torques.reshape(-1, 7).std(axis=0) + 1e-6
+
+    print("\nNormalization stats:")
     print(f"  vel_std: {vel_std}")
-    
-    # Create dataloaders
+
+    # Dataloaders (optionally larger batch for transformer)
     if args.model_type == 'transformer':
-        batch_size = config['training'].get('transformer_batch_size', 128)  # Bigger batches
+        batch_size = config['training'].get('transformer_batch_size', 128)
     else:
         batch_size = config['training']['batch_size']
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=0
-    )
-    
-    # Create model
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(val_dataset,   batch_size=config['training']['batch_size'], shuffle=False, num_workers=0)
+
+    # Model factory
     print(f"\nCreating {args.model_type} model...")
     if args.model_type == 'baseline':
         model = create_baseline_model(config)
-    else:
+    elif args.model_type == 'transformer':
         model = create_transformer_model(config)
+    elif args.model_type == 'lstm':
+        # default hyperparams; override here if you want via args (not required)
+        model = create_lstm_model(config, hidden_dim=128, num_layers=2, dropout=0.1)
+    else:
+        raise ValueError(args.model_type)
 
+    # Push normalization into the model (as in your previous training)
     model.pos_mean.copy_(torch.FloatTensor(pos_mean))
     model.pos_std.copy_(torch.FloatTensor(pos_std))
     model.vel_mean.copy_(torch.FloatTensor(vel_mean))
     model.vel_std.copy_(torch.FloatTensor(vel_std))
     model.tau_mean.copy_(torch.FloatTensor(tau_mean))
     model.tau_std.copy_(torch.FloatTensor(tau_std))
-    
-    # Create trainer
+
+    # Trainer
     trainer = Trainer(model, config, args.model_type)
-    
+
     # Train
     print("\nStarting training...")
     trainer.train(train_loader, val_loader, config['training']['num_epochs'])
@@ -435,12 +438,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train robot dynamics model')
     parser.add_argument('--model_type', type=str, default='transformer',
-                        choices=['baseline', 'transformer'],
+                        choices=['baseline', 'transformer', 'lstm'],
                         help='Model type to train')
     parser.add_argument('--config', type=str, default='configs/config.yaml',
                         help='Path to config file')
     parser.add_argument('--data_path', type=str, default='data/synthetic_dataset.npz',
                         help='Path to dataset')
-    
     args = parser.parse_args()
     main(args)
