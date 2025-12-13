@@ -6,7 +6,7 @@
 
 ## Abstract
 
-This repository implements and evaluates transformer-based predictive models for Model Predictive Control (MPC) of a 7-DOF KUKA LBR iiwa robotic manipulator. We compare a baseline feed-forward Deep Neural Network (DNN) against a novel Transformer architecture with multi-head self-attention for capturing temporal dependencies in robot dynamics. Experimental results demonstrate that incorporating temporal context through the Transformer architecture yields a **97.46% reduction in mean squared tracking error** compared to the memoryless baseline.
+This repository implements and evaluates transformer-based predictive models for Model Predictive Control (MPC) of a 7-DOF KUKA LBR iiwa robotic manipulator. We compare a baseline feed-forward Deep Neural Network (DNN) and a Long Short-Term Memory (LSTM) network against a novel Transformer architecture with multi-head self-attention for capturing temporal dependencies in robot dynamics. Experimental results demonstrate that incorporating temporal context through the Transformer architecture yields a **97.46% reduction in mean squared tracking error** compared to the memoryless baseline.
 
 ## Table of Contents
 
@@ -62,36 +62,70 @@ This work demonstrates that **temporal context matters** for accurate dynamics p
 flowchart TB
     subgraph Data Generation
         A[PyBullet Simulator] -->|Physics-based trajectories| B[Fourier Torque Excitation]
-        B -->|200 trajectories × 100 steps| C[Dataset: 20,000 samples]
+        B -->|200 trajectories x 100 steps| C[Dataset: 20,000 samples]
         C -->|70/20/10 split| D[Train/Val/Test Sets]
     end
     
     subgraph Model Training
         D -->|Sequences: history_length=10| E[Transformer Model]
+        D -->|Sequences: history_length=10| L[LSTM Model]
         D -->|Single timesteps| F[Baseline DNN]
         E -->|Adam + Cosine LR| G[Trained Transformer]
+        L -->|Adam| M[Trained LSTM]
         F -->|Adam optimizer| H[Trained Baseline]
     end
     
     subgraph MPC Controller
         G -->|Dynamics predictor| I[CasADi Optimization]
+        M -->|Dynamics predictor| I
         H -->|Dynamics predictor| I
-        I -->|Horizon N=12| J[Optimal Control τ*]
+        I -->|Horizon N=12| J[Optimal Control torque]
         J -->|Apply first control| K[Robot State x_next]
         K -->|Update history| I
     end
     
     subgraph Evaluation
-        K -->|Trajectory tracking| L[Performance Metrics]
-        L --> M[MSE, RMSE, MAE]
-        L --> N[Visualization: All 7 joints]
-        L --> O[Comparison plots]
+        K -->|Trajectory tracking| Eval[Performance Metrics]
+        Eval --> Score[MSE, RMSE, MAE]
+        Eval --> Viz[Visualization: All 7 joints]
+        Eval --> Plot[Comparison plots]
     end
     
     style E fill:#e1f5ff
     style G fill:#b3e5fc
     style I fill:#fff9c4
-    style L fill:#c8e6c9
+    style Eval fill:#c8e6c9
+```
+
+### Control Loop Sequence
+
+```mermaid
+sequenceDiagram
+    participant C as MPC Controller
+    participant M as Dynamics Model
+    participant O as Optimizer (CasADi)
+    participant R as Robot (Simulation)
+
+    loop Control Frequency (20 Hz)
+        R->>C: Current State (q, dq)
+        C->>C: Update History Buffer
+        
+        rect rgb(240, 248, 255)
+            note right of C: Optimization Step
+            C->>O: Init Optimization Problem
+            
+            loop Prediction Horizon (N=12)
+                O->>M: Query Dynamics (State, Action)
+                M-->>O: Predicted Next State
+                O->>O: Calculate Cost (Tracking + Control)
+            end
+            
+            O->>O: Minimize Objective
+            O-->>C: Optimal Control Sequence
+        end
+        
+        C->>R: Apply First Control Input (tau)
+    end
 ```
 
 ### Workflow Description
@@ -239,6 +273,11 @@ python src/train.py --model_type baseline --config configs/config.yaml --data_pa
 python src/train.py --model_type transformer --config configs/config.yaml --data_path data/synthetic_dataset.npz
 ```
 
+**LSTM:**
+```bash
+python src/train.py --model_type lstm --config configs/config.yaml --data_path data/synthetic_dataset.npz
+```
+
 **Monitor training:**
 ```bash
 tensorboard --logdir logs
@@ -248,6 +287,7 @@ tensorboard --logdir logs
 **Checkpoints saved to:**
 - `models/trained/baseline/best.pth`
 - `models/trained/transformer/best.pth`
+- `models/trained/lstm/best.pth`
 
 #### 4. Evaluate MPC Performance
 
@@ -296,6 +336,7 @@ transformer-mpc-kuka/
 │
 ├── models/
 │   ├── baseline_dnn.py             # Feed-forward DNN (4k params)
+│   ├── lstm_predictor.py           # LSTM model
 │   ├── transformer_predictor.py    # Transformer model (165k params)
 │   └── trained/
 │       ├── baseline/
@@ -369,6 +410,30 @@ Layer 7: Residual Connection
 - **Layer Normalization:** Improves gradient flow in deep networks
 
 **Parameter Count:** 165,248 trainable parameters
+
+### LSTM Architecture
+
+```
+Input: H_t = [(q_{t-9}, dq_{t-9}, τ_{t-9}), ..., (q_t, dq_t, τ_t)]
+       Shape: (batch_size, 10, 21)
+
+Layer 1: Input Projection
+    Linear(21 -> 128) + ReLU
+
+Layer 2-3: LSTM Layers (x2)
+    Hidden Size: 128
+    Dropout: 0.1
+
+Layer 4: Output Projection
+    Linear(128 -> 64) + ReLU
+    Linear(64 -> 14)
+    Output: delta_x = [delta_q, delta_dq]
+```
+
+**Key Characteristics:**
+- **Recurrent Memory:** Maintains hidden state across timesteps.
+- **Gated Mechanisms:** Controls information flow (input, forget, output gates).
+- **History Length:** 10 timesteps (same as Transformer).
 
 ### Baseline DNN Architecture
 
@@ -594,13 +659,12 @@ python src/diagnose.py
 
 ### Immediate Extensions
 
-1. **LSTM Comparison:** Implement LSTM architecture for efficiency vs. accuracy tradeoff analysis
-2. **Attention Visualization:** Extract and plot attention weights to interpret which past timesteps influence predictions
-3. **Real-time Optimization:** 
+1. **Attention Visualization:** Extract and plot attention weights to interpret which past timesteps influence predictions
+2. **Real-time Optimization:** 
    - Implement warm-starting from previous MPC solution
    - Use GPU for neural network inference
    - Reduce horizon to N=8 for faster solves
-4. **Hardware Deployment:** Test on physical KUKA LBR iiwa robot with ROS integration
+3. **Hardware Deployment:** Test on physical KUKA LBR iiwa robot with ROS integration
 
 ### Research Directions
 
